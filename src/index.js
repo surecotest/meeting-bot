@@ -5,8 +5,11 @@ import { WebSocketServer } from 'ws';
 import twilio from 'twilio';
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // --- Recording: μ-law → PCM, WAV every 1 min ---
 
@@ -37,6 +40,106 @@ function mulawToPcm(mulawBuf) {
   return out;
 }
 
+/** G.711 μ-law compress: 16-bit PCM (little-endian) → μ-law */
+function pcmToMulaw(pcmBuf) {
+  const MULAW_BIAS = 0x84;
+  const MULAW_MAX = 32635; // 0x7f7b
+  const out = Buffer.alloc(pcmBuf.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    let sample = pcmBuf.readInt16LE(i * 2);
+    const sign = (sample >>> 15) & 0x01;
+    if (sample < 0) sample = -sample;
+    if (sample > MULAW_MAX) sample = MULAW_MAX;
+    sample += MULAW_BIAS;
+    let exponent = 7;
+    for (let exp = 0; exp < 8; exp++) {
+      if (sample <= (0x1f << (exp + 2))) {
+        exponent = exp;
+        break;
+      }
+    }
+    const mantissa = (sample >> (exponent + 3)) & 0x0f;
+    let mulaw = (sign << 7) | (exponent << 4) | mantissa;
+    out[i] = ~mulaw;
+  }
+  return out;
+}
+
+/** Generate TTS audio "Hi Thank you" and return as μ-law 8kHz buffer */
+let cachedAudio = null;
+function generateTtsAudio() {
+  if (cachedAudio) return cachedAudio;
+  
+  const tempDir = path.join(process.cwd(), 'temp');
+  try { fs.mkdirSync(tempDir, { recursive: true }); } catch (_) {}
+  
+  const tempAiff = path.join(tempDir, 'tts_temp.aiff');
+  const temp8k = path.join(tempDir, 'tts_8k.wav');
+  
+  try {
+    // Use macOS 'say' command - outputs AIFF by default
+    // Try Samantha first, fallback to default voice
+    let sayCmd = `say -v Samantha "Hi Thank you" -o "${tempAiff}"`;
+    try {
+      execSync(sayCmd, { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch {
+      // Fallback to default voice if Samantha not available
+      sayCmd = `say "Hi Thank you" -o "${tempAiff}"`;
+      execSync(sayCmd, { stdio: ['ignore', 'ignore', 'pipe'] });
+    }
+    
+    // Check if file was created
+    if (!fs.existsSync(tempAiff)) {
+      throw new Error('say command did not create output file');
+    }
+    
+    // Convert AIFF to 8kHz mono WAV using ffmpeg (if available) or sox
+    try {
+      execSync(`ffmpeg -i "${tempAiff}" -ar 8000 -ac 1 -f wav "${temp8k}" -y`, { 
+        stdio: ['ignore', 'ignore', 'pipe'] 
+      });
+    } catch (ffmpegErr) {
+      // Fallback: try sox
+      try {
+        execSync(`sox "${tempAiff}" -r 8000 -c 1 "${temp8k}"`, { 
+          stdio: ['ignore', 'ignore', 'pipe'] 
+        });
+      } catch (soxErr) {
+        throw new Error(`Audio conversion failed. ffmpeg error: ${ffmpegErr.message}, sox error: ${soxErr.message}`);
+      }
+    }
+    
+    // Check if converted file exists
+    if (!fs.existsSync(temp8k)) {
+      throw new Error('Audio conversion did not create output file');
+    }
+    
+    // Read WAV file (skip 44-byte header)
+    const wavData = fs.readFileSync(temp8k);
+    if (wavData.length < 44) {
+      throw new Error('WAV file too small');
+    }
+    const pcmData = wavData.slice(44); // Skip WAV header
+    if (pcmData.length === 0) {
+      throw new Error('WAV file has no audio data');
+    }
+    const mulaw = pcmToMulaw(pcmData);
+    
+    // Cleanup
+    try { fs.unlinkSync(tempAiff); } catch (_) {}
+    try { fs.unlinkSync(temp8k); } catch (_) {}
+    
+    cachedAudio = mulaw;
+    console.log('[tts] Generated audio:', mulaw.length, 'bytes μ-law');
+    return mulaw;
+  } catch (e) {
+    console.error('[tts] Error generating audio:', e.message);
+    // Fallback: generate silence (1 second at 8kHz = 8000 samples = 8000 bytes μ-law)
+    console.log('[tts] Using silence fallback');
+    return Buffer.alloc(8000, 0x7f); // μ-law silence
+  }
+}
+
 /** Write 8 kHz mono 16-bit WAV file */
 function writeWavFile(filepath, pcmBuffer, sampleRate = 8000) {
   const numChannels = 1;
@@ -60,8 +163,6 @@ function writeWavFile(filepath, pcmBuffer, sampleRate = 8000) {
   header.writeUInt32LE(dataSize, 40);
   fs.writeFileSync(filepath, Buffer.concat([header, pcmBuffer]));
 }
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT ?? 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -86,6 +187,7 @@ wss.on('connection', (ws, req) => {
     streamSid: null,
     pcmChunks: [],
     saveTimer: null,
+    outboundTimer: null, // Timer for sending audio every 5 seconds
   };
 
   function flushToFile() {
@@ -103,10 +205,57 @@ wss.on('connection', (ws, req) => {
     }
   }
 
+  function sendOutboundAudio() {
+    if (!connState.streamSid || ws.readyState !== ws.OPEN) return;
+    
+    const mulaw = generateTtsAudio();
+    const payload = mulaw.toString('base64');
+    
+    // Split into chunks (Twilio recommends ~160 bytes per message for 20ms of audio)
+    const chunkSize = 160; // ~20ms at 8kHz
+    for (let i = 0; i < mulaw.length; i += chunkSize) {
+      const chunk = mulaw.slice(i, i + chunkSize);
+      const chunkPayload = chunk.toString('base64');
+      
+      const mediaMsg = {
+        event: 'media',
+        streamSid: connState.streamSid,
+        media: {
+          payload: chunkPayload,
+        },
+      };
+      
+      try {
+        ws.send(JSON.stringify(mediaMsg));
+      } catch (e) {
+        console.error('[stream] Error sending outbound audio', e);
+        return;
+      }
+    }
+    
+    // Send mark to track playback completion
+    const markMsg = {
+      event: 'mark',
+      streamSid: connState.streamSid,
+      mark: {
+        name: `tts_${Date.now()}`,
+      },
+    };
+    try {
+      ws.send(JSON.stringify(markMsg));
+    } catch (e) {
+      console.error('[stream] Error sending mark', e);
+    }
+  }
+
   function stopRecording() {
     if (connState.saveTimer) {
       clearInterval(connState.saveTimer);
       connState.saveTimer = null;
+    }
+    if (connState.outboundTimer) {
+      clearInterval(connState.outboundTimer);
+      connState.outboundTimer = null;
     }
     flushToFile();
   }
@@ -121,6 +270,11 @@ wss.on('connection', (ws, req) => {
         case 'start':
           connState.streamSid = msg.streamSid;
           connState.saveTimer = setInterval(flushToFile, RECORD_INTERVAL_MS);
+          // Send "Hi Thank you" every 5 seconds
+          // connState.outboundTimer = setInterval(sendOutboundAudio, 5000);
+
+          // Send immediately on start
+          setTimeout(() => sendOutboundAudio(), 1000);
           console.log('[stream] start', {
             streamSid: msg.streamSid,
             callSid: msg.start?.callSid,
@@ -169,16 +323,15 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 
 app.all('/voice', (req, res) => {
   const response = new VoiceResponse();
-  // const start = response.start();
+  // Use <Connect><Stream> for bidirectional streams (can send audio back)
   const connect = response.connect();
   const streamUrl = `${WS_BASE}/stream`;
   connect.stream({
     name: 'MeetingBotStream',
     url: streamUrl,
-    // track: 'both_tracks',
   });
-  response.say('Stream started. You are connected to the meeting bot.');
-  // Keep the call open so the Media Stream continues; max Pause is 4 hours
+  // Note: With <Connect><Stream>, subsequent TwiML is not executed
+  // The call stays connected while the stream is active
   res.type('text/xml');
   res.send(response.toString());
 });
