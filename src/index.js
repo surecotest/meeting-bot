@@ -3,20 +3,17 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import twilio from 'twilio';
-import path from 'path';
 import {
-  RECORDINGS_DIR,
-  RECORD_INTERVAL_MS,
-  ensureRecordingsDir,
   mulawToPcm,
-  writeMulawWavFile,
-  writeWavFile,
 } from './audio.js';
 import { createGeminiLiveTranslator } from './geminiLive.js';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+const LATENCY_LOG = process.env.LATENCY_LOG === '1';
+const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
 
 const PORT = process.env.PORT ?? 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -39,9 +36,6 @@ const wss = new WebSocketServer({ server, path: '/stream' });
 wss.on('connection', (ws, req) => {
   const connState = {
     streamSid: null,
-    pcmChunks: [],
-    mulawChunks: [],
-    saveTimer: null,
   };
 
   const gemini = createGeminiLiveTranslator({
@@ -49,46 +43,9 @@ wss.on('connection', (ws, req) => {
     getStreamSid: () => connState.streamSid,
   });
 
-  function flushToFile() {
-    if (!connState.streamSid) return;
-    if (connState.pcmChunks.length === 0 && connState.mulawChunks.length === 0) return;
-    ensureRecordingsDir();
-    const pcm = connState.pcmChunks.length ? Buffer.concat(connState.pcmChunks) : Buffer.alloc(0);
-    const mulaw = connState.mulawChunks.length ? Buffer.concat(connState.mulawChunks) : Buffer.alloc(0);
-    connState.pcmChunks = [];
-    connState.mulawChunks = [];
-
-    const sampleRate = 8000; // Twilio inbound is 8kHz μ-law
-    const recordCodec = (process.env.RECORD_CODEC || 'pcm').toLowerCase(); // pcm | mulaw | both
-    const base = `stream_${connState.streamSid}_${Date.now()}`;
-    try {
-      if (recordCodec === 'mulaw' || recordCodec === 'both') {
-        const filename = `${base}_mulaw.wav`;
-        const filepath = path.join(RECORDINGS_DIR, filename);
-        writeMulawWavFile(filepath, mulaw, sampleRate);
-        const duration = (mulaw.length / sampleRate).toFixed(1);
-        console.log('[stream] wrote', filename, `${duration}s @ ${sampleRate}Hz (μ-law)`);
-      }
-
-      if (recordCodec === 'pcm' || recordCodec === 'both') {
-        const filename = recordCodec === 'both' ? `${base}_pcm.wav` : `${base}.wav`;
-        const filepath = path.join(RECORDINGS_DIR, filename);
-        writeWavFile(filepath, pcm, sampleRate);
-        const duration = (pcm.length / 16000).toFixed(1); // bytes/sec for PCM16 @ 8kHz
-        console.log('[stream] wrote', filename, `${duration}s @ ${sampleRate}Hz (PCM16)`);
-      }
-    } catch (e) {
-      console.error('[stream] write error', e);
-    }
-  }
-
-  function stopRecording() {
-    if (connState.saveTimer) {
-      clearInterval(connState.saveTimer);
-      connState.saveTimer = null;
-    }
+  // Recording is intentionally disabled (to minimize latency).
+  function stopStream() {
     gemini.stop();
-    flushToFile();
   }
 
   ws.on('message', (data) => {
@@ -100,7 +57,6 @@ wss.on('connection', (ws, req) => {
           break;
         case 'start':
           connState.streamSid = msg.streamSid;
-          connState.saveTimer = setInterval(flushToFile, RECORD_INTERVAL_MS);
           gemini.start();
 
           console.log('[stream] start', {
@@ -114,14 +70,12 @@ wss.on('connection', (ws, req) => {
           if (msg.media?.payload) {
             const mulaw = Buffer.from(msg.media.payload, 'base64');
             const pcm = mulawToPcm(mulaw);
-            connState.pcmChunks.push(pcm);
-            connState.mulawChunks.push(mulaw);
             gemini.handleInboundPcm(pcm, msg.media?.track);
           }
           break;
         case 'stop':
           console.log('[stream] stop', msg.streamSid);
-          stopRecording();
+          stopStream();
           connState.streamSid = null;
           break;
         case 'dtmf':
@@ -139,7 +93,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    stopRecording();
+    stopStream();
   });
 
   ws.on('error', (err) => {
@@ -310,10 +264,8 @@ app.get('/', (req, res) => {
 });
 
 server.listen(PORT, () => {
-  ensureRecordingsDir();
   console.log(`Server listening on http://localhost:${PORT}`);
   console.log(`WebSocket (Twilio stream): ${WS_BASE}/stream`);
-  console.log(`Recordings (every ${RECORD_INTERVAL_MS / 1000}s): ${RECORDINGS_DIR}`);
   if (!twilioClient) {
     console.log('Twilio not configured. Set env vars to enable /call.');
   }

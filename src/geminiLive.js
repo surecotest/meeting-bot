@@ -4,6 +4,9 @@ import { spawn } from 'child_process';
 
 const clientsByKey = new Map();
 
+const LATENCY_LOG = process.env.LATENCY_LOG === '1';
+const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
+
 function getClient(apiKey) {
   if (!apiKey) return null;
   if (clientsByKey.has(apiKey)) return clientsByKey.get(apiKey);
@@ -24,7 +27,7 @@ export function createGeminiLiveTranslator({
   getStreamSid,
   apiKey = process.env.GEMINI_API_KEY,
   model = 'gemini-2.5-flash-native-audio-preview-12-2025',
-  flushIntervalMs = 200,
+  flushIntervalMs = 40,
 } = {}) {
   const geminiClient = getClient(apiKey);
   let warnedMissingKey = false;
@@ -43,6 +46,25 @@ export function createGeminiLiveTranslator({
   let ffmpegPcmCarry = Buffer.alloc(0);
   let outboundPcm8kRemainder = Buffer.alloc(0);
   let fallbackPcm24kBuffer = Buffer.alloc(0);
+
+  // --- latency tracing (opt-in) ---
+  let lastInboundPcmAt = 0;
+  let lastInboundBytes = 0;
+  let lastGeminiSendAt = 0;
+  let lastGeminiSendBytes = 0;
+  let lastGeminiAudioAt = 0;
+  let lastTwilioSendAt = 0;
+  let lastQueueBecameNonEmptyAt = 0;
+  let lastLatencyLogAt = 0;
+
+  function logLatency(label, extra = {}) {
+    if (!LATENCY_LOG) return;
+    const t = nowMs();
+    // Rate-limit to avoid spam under high chunk rates
+    if (t - lastLatencyLogAt < 250) return;
+    lastLatencyLogAt = t;
+    console.log('[latency]', label, extra);
+  }
 
   const OUT_SAMPLE_RATE = 8000;
   const FRAME_SAMPLES = 160; // 20ms @ 8kHz
@@ -63,6 +85,7 @@ export function createGeminiLiveTranslator({
       outboundPcm8kRemainder.length > 0 ? Buffer.concat([outboundPcm8kRemainder, pcm8k]) : pcm8k;
 
     let offset = 0;
+    const wasEmpty = outboundMulawQueue.length === 0;
     while (offset + FRAME_BYTES_PCM16 <= buf.length) {
       const framePcm = buf.subarray(offset, offset + FRAME_BYTES_PCM16);
       const frameMulaw = pcmToMulaw(framePcm); // 160 bytes
@@ -71,7 +94,18 @@ export function createGeminiLiveTranslator({
     }
 
     outboundPcm8kRemainder = buf.subarray(offset);
-    if (outboundMulawQueue.length > 0) ensureOutboundPlayback();
+    if (outboundMulawQueue.length > 0) {
+      if (wasEmpty) {
+        lastQueueBecameNonEmptyAt = nowMs();
+        if (lastGeminiAudioAt) {
+          logLatency('queue_nonempty', {
+            ms_since_gemini_audio: +(lastQueueBecameNonEmptyAt - lastGeminiAudioAt).toFixed(1),
+            frames_queued: outboundMulawQueue.length,
+          });
+        }
+      }
+      ensureOutboundPlayback();
+    }
   }
 
   function flushOutboundPcmRemainderWithSilence() {
@@ -89,6 +123,7 @@ export function createGeminiLiveTranslator({
     if (ffmpegResampler || ffmpegUnavailable) return;
 
     try {
+      const t0 = nowMs();
       ffmpegResampler = spawn(
         'ffmpeg',
         [
@@ -115,6 +150,7 @@ export function createGeminiLiveTranslator({
         ],
         { stdio: ['pipe', 'pipe', 'pipe'] }
       );
+      if (LATENCY_LOG) logLatency('ffmpeg_spawned', { ms: +(nowMs() - t0).toFixed(1) });
     } catch (e) {
       ffmpegUnavailable = true;
       ffmpegResampler = null;
@@ -218,6 +254,7 @@ export function createGeminiLiveTranslator({
       return;
     }
 
+    const t0 = nowMs();
     ws.send(
       JSON.stringify({
         event: 'media',
@@ -225,6 +262,15 @@ export function createGeminiLiveTranslator({
         media: { payload: frame.toString('base64') },
       })
     );
+    lastTwilioSendAt = t0;
+    if (lastQueueBecameNonEmptyAt) {
+      logLatency('twilio_send', {
+        ms_queue_to_send: +(t0 - lastQueueBecameNonEmptyAt).toFixed(1),
+        queue_frames_left: outboundMulawQueue.length,
+      });
+      // Only measure the first send after queue becomes non-empty.
+      lastQueueBecameNonEmptyAt = 0;
+    }
 
     // If we just drained the queue, send a single mark and stop playback.
     if (outboundMulawQueue.length === 0) {
@@ -276,8 +322,17 @@ export function createGeminiLiveTranslator({
 
               // Native audio output arrives as base64 PCM16 @ 24kHz in message.data
               if (message?.data) {
+                const tMsg = nowMs();
                 const pcm24k = Buffer.from(message.data, 'base64');
                 if (pcm24k.length > 0) {
+                  lastGeminiAudioAt = tMsg;
+                  if (lastGeminiSendAt) {
+                    logLatency('gemini_audio', {
+                      ms_since_send: +(tMsg - lastGeminiSendAt).toFixed(1),
+                      in_bytes: lastGeminiSendBytes,
+                      out_bytes: pcm24k.length,
+                    });
+                  }
                   if (!ffmpegUnavailable) {
                     startFfmpegResampler();
                   }
@@ -343,12 +398,22 @@ export function createGeminiLiveTranslator({
     if (pcm8k.length === 0) return;
 
     try {
+      const t0 = nowMs();
       geminiSession.sendRealtimeInput({
         audio: {
           data: pcm8k.toString('base64'),
           mimeType: 'audio/pcm;rate=8000',
         },
       });
+      lastGeminiSendAt = t0;
+      lastGeminiSendBytes = pcm8k.length;
+      if (lastInboundPcmAt) {
+        logLatency('gemini_send', {
+          ms_since_inbound: +(t0 - lastInboundPcmAt).toFixed(1),
+          inbound_bytes: lastInboundBytes,
+          sent_bytes: pcm8k.length,
+        });
+      }
     } catch (e) {
       console.error('[gemini] sendRealtimeInput error', e?.message ?? e);
     }
@@ -370,6 +435,11 @@ export function createGeminiLiveTranslator({
     // Avoid retranslating our own outbound audio (Twilio provides track=inbound/outbound in bidirectional mode)
     const isInbound = !track || track === 'inbound';
     if (!isInbound) return;
+
+    if (LATENCY_LOG) {
+      lastInboundPcmAt = nowMs();
+      lastInboundBytes = pcm8k?.length ?? 0;
+    }
 
     if (geminiSession) {
       geminiInPcmChunks.push(pcm8k);
