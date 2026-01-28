@@ -15,6 +15,8 @@ app.use(express.urlencoded({ extended: true }));
 
 const RECORDINGS_DIR = path.join(process.cwd(), 'recordings');
 const RECORD_INTERVAL_MS = 60 * 1000; // 1 minute
+const OUTPUT_SAMPLE_RATE = parseInt(process.env.OUTPUT_SAMPLE_RATE) || 16000; // 16kHz for better quality (or 44100 for CD quality)
+const OUTPUT_BIT_DEPTH = 16; // 16-bit for good quality
 
 function ensureRecordingsDir() {
   try {
@@ -140,13 +142,126 @@ function generateTtsAudio() {
   }
 }
 
-/** Write 8 kHz mono 16-bit WAV file */
-function writeWavFile(filepath, pcmBuffer, sampleRate = 8000) {
+/** Upsample PCM audio using linear interpolation (simple but effective) */
+function upsamplePcm(pcmBuffer, fromRate, toRate) {
+  if (fromRate === toRate) return pcmBuffer;
+  
+  const ratio = toRate / fromRate;
+  const inputSamples = pcmBuffer.length / 2; // 16-bit = 2 bytes per sample
+  const outputSamples = Math.floor(inputSamples * ratio);
+  const output = Buffer.alloc(outputSamples * 2);
+  
+  for (let i = 0; i < outputSamples; i++) {
+    const srcIndex = i / ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, inputSamples - 1);
+    const t = srcIndex - srcIndexFloor;
+    
+    const sample1 = pcmBuffer.readInt16LE(srcIndexFloor * 2);
+    const sample2 = pcmBuffer.readInt16LE(srcIndexCeil * 2);
+    const interpolated = Math.round(sample1 + (sample2 - sample1) * t);
+    output.writeInt16LE(interpolated, i * 2);
+  }
+  
+  return output;
+}
+
+/** Apply noise reduction: noise gate, smoothing, and normalization */
+function enhanceAudio(pcmBuffer) {
+  const samples = pcmBuffer.length / 2;
+  const NOISE_GATE_THRESHOLD = 500; // Samples below this are considered noise (0-32767)
+  const SMOOTHING_WINDOW = 3; // Moving average window size
+  const NOISE_REDUCTION_FACTOR = 0.3; // How much to reduce noise (0-1)
+  
+  // First pass: calculate RMS and identify noise floor
+  let sumSquared = 0;
+  let peakAmplitude = 0;
+  const noiseSamples = [];
+  
+  for (let i = 0; i < samples; i++) {
+    const sample = pcmBuffer.readInt16LE(i * 2);
+    const absSample = Math.abs(sample);
+    sumSquared += sample * sample;
+    if (absSample > peakAmplitude) peakAmplitude = absSample;
+    
+    // Identify quiet samples (likely noise)
+    if (absSample < NOISE_GATE_THRESHOLD) {
+      noiseSamples.push(i);
+    }
+  }
+  
+  const rms = Math.sqrt(sumSquared / samples);
+  const noiseFloor = rms * 0.1; // Estimate noise floor as 10% of RMS
+  
+  // Second pass: apply noise reduction and smoothing
+  const output = Buffer.alloc(pcmBuffer.length);
+  const window = [];
+  
+  for (let i = 0; i < samples; i++) {
+    let sample = pcmBuffer.readInt16LE(i * 2);
+    const absSample = Math.abs(sample);
+    
+    // Noise gate: silence samples below threshold
+    if (absSample < NOISE_GATE_THRESHOLD) {
+      sample = 0;
+    } else {
+      // Spectral subtraction: reduce noise floor
+      const noiseReduction = Math.max(0, absSample - noiseFloor * NOISE_REDUCTION_FACTOR);
+      sample = sample > 0 ? noiseReduction : -noiseReduction;
+    }
+    
+    // Moving average smoothing (reduce high-frequency noise)
+    window.push(sample);
+    if (window.length > SMOOTHING_WINDOW) {
+      window.shift();
+    }
+    
+    const smoothed = window.reduce((sum, s) => sum + s, 0) / window.length;
+    sample = Math.round(smoothed);
+    sample = Math.max(-32767, Math.min(32767, sample));
+    
+    output.writeInt16LE(sample, i * 2);
+  }
+  
+  // Third pass: normalize (only if there's actual audio content)
+  if (peakAmplitude > 100) {
+    const normalizeFactor = (32767 * 0.85) / peakAmplitude; // 85% to avoid clipping
+    
+    for (let i = 0; i < samples; i++) {
+      let sample = output.readInt16LE(i * 2);
+      sample = Math.round(sample * normalizeFactor);
+      sample = Math.max(-32767, Math.min(32767, sample));
+      output.writeInt16LE(sample, i * 2);
+    }
+  }
+  
+  return output;
+}
+
+/** Write high-quality WAV file with optional upsampling and enhancement */
+function writeWavFile(filepath, pcmBuffer, inputSampleRate = 8000) {
   const numChannels = 1;
-  const bitsPerSample = 16;
+  const bitsPerSample = OUTPUT_BIT_DEPTH;
+  const enableNoiseReduction = process.env.ENABLE_NOISE_REDUCTION !== 'false';
+  
+  // Upsample if needed
+  let processedPcm = pcmBuffer;
+  if (inputSampleRate < OUTPUT_SAMPLE_RATE) {
+    processedPcm = upsamplePcm(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
+  } else if (inputSampleRate > OUTPUT_SAMPLE_RATE) {
+    // Downsample if somehow higher (shouldn't happen with Twilio)
+    processedPcm = upsamplePcm(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
+  }
+  
+  // Apply noise reduction if enabled
+  if (enableNoiseReduction) {
+    processedPcm = enhanceAudio(processedPcm);
+  }
+  
+  const sampleRate = OUTPUT_SAMPLE_RATE;
   const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
   const blockAlign = numChannels * (bitsPerSample / 8);
-  const dataSize = pcmBuffer.length;
+  const dataSize = processedPcm.length;
   const header = Buffer.alloc(44);
   header.write('RIFF', 0);
   header.writeUInt32LE(36 + dataSize, 4);
@@ -161,7 +276,7 @@ function writeWavFile(filepath, pcmBuffer, sampleRate = 8000) {
   header.writeUInt16LE(bitsPerSample, 34);
   header.write('data', 36);
   header.writeUInt32LE(dataSize, 40);
-  fs.writeFileSync(filepath, Buffer.concat([header, pcmBuffer]));
+  fs.writeFileSync(filepath, Buffer.concat([header, processedPcm]));
 }
 
 const PORT = process.env.PORT ?? 3000;
@@ -198,8 +313,9 @@ wss.on('connection', (ws, req) => {
     const filename = `stream_${connState.streamSid}_${Date.now()}.wav`;
     const filepath = path.join(RECORDINGS_DIR, filename);
     try {
-      writeWavFile(filepath, pcm, 8000);
-      console.log('[stream] wrote', filename, `${(pcm.length / 16000).toFixed(1)}s`);
+      writeWavFile(filepath, pcm, 8000); // Input is 8kHz from Twilio
+      const duration = (pcm.length / 16000).toFixed(1); // Original duration
+      console.log('[stream] wrote', filename, `${duration}s @ ${OUTPUT_SAMPLE_RATE}Hz`);
     } catch (e) {
       console.error('[stream] write error', e);
     }
@@ -271,8 +387,7 @@ wss.on('connection', (ws, req) => {
           connState.streamSid = msg.streamSid;
           connState.saveTimer = setInterval(flushToFile, RECORD_INTERVAL_MS);
           // Send "Hi Thank you" every 5 seconds
-          // connState.outboundTimer = setInterval(sendOutboundAudio, 5000);
-
+          connState.outboundTimer = setInterval(sendOutboundAudio, 5000);
           // Send immediately on start
           setTimeout(() => sendOutboundAudio(), 1000);
           console.log('[stream] start', {
