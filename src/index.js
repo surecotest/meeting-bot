@@ -228,13 +228,102 @@ app.post('/call', async (req, res) => {
   }
 });
 
+// --- Initiate outbound call that joins Zoom via SIP ---
+
+app.post('/call/zoom', async (req, res) => {
+  if (!twilioClient) {
+    return res.status(500).json({
+      error: 'Twilio not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.',
+    });
+  }
+
+  const streamUrl = `${WS_BASE}/stream`;
+
+  const to = req.body?.to || req.query?.to;
+  const from = req.body?.from || req.query?.from || twilioPhoneNumber;
+  const meetingId = req.body?.meetingId ?? req.query?.meetingId;
+  const passcode = req.body?.passcode ?? req.query?.passcode;
+
+  if (!to) {
+    return res.status(400).json({ error: 'Missing "to" (phone number).' });
+  }
+  if (!from) {
+    return res.status(400).json({ error: 'Missing "from" (Twilio number). Set TWILIO_PHONE_NUMBER or pass "from".' });
+  }
+  if (meetingId === undefined || meetingId === null || meetingId === '') {
+    return res.status(400).json({ error: 'Missing "meetingId".' });
+  }
+
+  const meetingIdStr = String(meetingId).trim();
+  const passcodeStr = passcode != null && passcode !== '' ? String(passcode).trim() : '';
+
+  const params = new URLSearchParams({ meetingId: meetingIdStr });
+  if (passcodeStr) params.set('passcode', passcodeStr);
+
+  if (BASE_URL.startsWith('http://localhost')) {
+    console.warn('[call/zoom] BASE_URL is localhost. Twilio cannot reach it. Use ngrok and set BASE_URL.');
+  }
+
+  try {
+    const twiml = `
+      <Response>
+        <Start>
+          <Transcription statusCallbackUrl="${BASE_URL}/transcribe"/> 
+        </Start>   
+        <Pause length="1" />
+        <Play digits="${meetingIdStr}#"></Play>
+        <Pause length="3"/>
+        <Play digits="#"></Play>
+        <Pause length="3"/>
+        <Play digits="${passcodeStr}#"></Play>
+        <Connect>
+          <Stream url="${streamUrl}" />
+        </Connect>
+      </Response>`;
+    const call = await twilioClient.calls.create({
+      to,
+      from,
+      twiml
+    });
+    res.json({ sid: call.sid, status: call.status });
+  } catch (err) {
+    console.error('[call/zoom] Twilio error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Transcribe: print TranscriptionData.transcript (Twilio Real-Time Transcription callback) ---
+
+app.all('/transcribe', (req, res) => {
+  const body = req.body || {};
+  const event = body.TranscriptionEvent;
+  const transcriptionDataRaw = body.TranscriptionData;
+
+  if (event === 'transcription-content' && transcriptionDataRaw) {
+    try {
+      const data = typeof transcriptionDataRaw === 'string' ? JSON.parse(transcriptionDataRaw) : transcriptionDataRaw;
+      const transcript = data?.transcript;
+      if (transcript != null && transcript !== '') {
+        console.log('Transcribe: ' + transcript);
+      }
+    } catch (e) {
+      console.error('[transcribe] parse TranscriptionData error', e.message);
+    }
+  }
+
+  res.type('application/json');
+  res.status(200).json({ received: true });
+});
+
 // --- Health ---
 
 app.get('/', (req, res) => {
   res.json({
     service: 'meeting-bot',
     endpoints: {
-      'POST /call': 'Start outbound call (body: { to })',
+      'POST /call': 'Start outbound call (body: { from?, to })',
+      'POST /call/zoom': 'Start outbound call that joins Zoom via SIP (body: { from?, to, meetingId, passcode? })',
+      'GET/POST /transcribe': 'Echo and print request payload (query + body)',
       'GET /voice': 'TwiML webhook – stream call audio to /stream',
       'ws /stream': 'WebSocket for Twilio Media Streams',
     },
