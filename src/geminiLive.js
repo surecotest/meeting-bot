@@ -27,7 +27,6 @@ export function createGeminiLiveTranslator({
   getStreamSid,
   apiKey = process.env.GEMINI_API_KEY,
   model = 'gemini-2.5-flash-native-audio-preview-12-2025',
-  flushIntervalMs = 40,
 } = {}) {
   const geminiClient = getClient(apiKey);
   let warnedMissingKey = false;
@@ -35,8 +34,10 @@ export function createGeminiLiveTranslator({
   let geminiSession = null;
   let geminiConnectPromise = null;
 
-  let geminiInPcmChunks = [];
-  let geminiInFlushTimer = null;
+  // Send Gemini input as fixed 20ms frames for lowest latency.
+  // 20ms @ 8kHz PCM16 = 160 samples = 320 bytes
+  const GEMINI_FRAME_BYTES = 320;
+  let geminiFrameCarry = Buffer.alloc(0);
 
   let outboundMulawQueue = [];
   let outboundPlaybackTimer = null;
@@ -216,6 +217,38 @@ export function createGeminiLiveTranslator({
     console.warn('[gemini] GEMINI_API_KEY not set; translation disabled');
   }
 
+  function drainGeminiFrames() {
+    if (!geminiSession) return;
+    if (geminiFrameCarry.length < GEMINI_FRAME_BYTES) return;
+
+    while (geminiFrameCarry.length >= GEMINI_FRAME_BYTES) {
+      const frame = geminiFrameCarry.subarray(0, GEMINI_FRAME_BYTES);
+      geminiFrameCarry = geminiFrameCarry.subarray(GEMINI_FRAME_BYTES);
+
+      try {
+        const t0 = nowMs();
+        geminiSession.sendRealtimeInput({
+          audio: {
+            data: frame.toString('base64'),
+            mimeType: 'audio/pcm;rate=8000',
+          },
+        });
+        lastGeminiSendAt = t0;
+        lastGeminiSendBytes = frame.length;
+        if (lastInboundPcmAt) {
+          logLatency('gemini_send', {
+            ms_since_inbound: +(t0 - lastInboundPcmAt).toFixed(1),
+            inbound_bytes: lastInboundBytes,
+            sent_bytes: frame.length,
+          });
+        }
+      } catch (e) {
+        console.error('[gemini] sendRealtimeInput error', e?.message ?? e);
+        // Keep going; best-effort streaming.
+      }
+    }
+  }
+
   function sendMark(streamSid) {
     const markMsg = {
       event: 'mark',
@@ -376,6 +409,7 @@ export function createGeminiLiveTranslator({
       })
       .then((session) => {
         geminiSession = session;
+        drainGeminiFrames();
         return session;
       })
       .catch((err) => {
@@ -389,36 +423,6 @@ export function createGeminiLiveTranslator({
     return geminiConnectPromise;
   }
 
-  function flushGeminiAudio() {
-    if (!geminiSession) return;
-    if (geminiInPcmChunks.length === 0) return;
-
-    const pcm8k = Buffer.concat(geminiInPcmChunks);
-    geminiInPcmChunks = [];
-    if (pcm8k.length === 0) return;
-
-    try {
-      const t0 = nowMs();
-      geminiSession.sendRealtimeInput({
-        audio: {
-          data: pcm8k.toString('base64'),
-          mimeType: 'audio/pcm;rate=8000',
-        },
-      });
-      lastGeminiSendAt = t0;
-      lastGeminiSendBytes = pcm8k.length;
-      if (lastInboundPcmAt) {
-        logLatency('gemini_send', {
-          ms_since_inbound: +(t0 - lastInboundPcmAt).toFixed(1),
-          inbound_bytes: lastInboundBytes,
-          sent_bytes: pcm8k.length,
-        });
-      }
-    } catch (e) {
-      console.error('[gemini] sendRealtimeInput error', e?.message ?? e);
-    }
-  }
-
   function start() {
     if (!geminiClient) {
       logMissingKeyOnce();
@@ -426,9 +430,6 @@ export function createGeminiLiveTranslator({
     }
 
     ensureGeminiSession().catch(() => {});
-    if (!geminiInFlushTimer) {
-      geminiInFlushTimer = setInterval(flushGeminiAudio, flushIntervalMs);
-    }
   }
 
   function handleInboundPcm(pcm8k, track) {
@@ -442,7 +443,12 @@ export function createGeminiLiveTranslator({
     }
 
     if (geminiSession) {
-      geminiInPcmChunks.push(pcm8k);
+      // Ensure int16 alignment
+      if (pcm8k.length % 2 !== 0) pcm8k = pcm8k.subarray(0, pcm8k.length - 1);
+      if (pcm8k.length === 0) return;
+
+      geminiFrameCarry = Buffer.concat([geminiFrameCarry, pcm8k]);
+      drainGeminiFrames();
       return;
     }
 
@@ -452,20 +458,22 @@ export function createGeminiLiveTranslator({
     }
 
     ensureGeminiSession().then((session) => {
-      if (session) geminiInPcmChunks.push(pcm8k);
+      if (!session) return;
+      // Ensure int16 alignment
+      if (pcm8k.length % 2 !== 0) pcm8k = pcm8k.subarray(0, pcm8k.length - 1);
+      if (pcm8k.length === 0) return;
+
+      geminiFrameCarry = Buffer.concat([geminiFrameCarry, pcm8k]);
+      drainGeminiFrames();
     });
   }
 
   function stop() {
-    if (geminiInFlushTimer) {
-      clearInterval(geminiInFlushTimer);
-      geminiInFlushTimer = null;
-    }
     stopOutboundPlayback();
     flushOutboundPcmRemainderWithSilence();
     stopFfmpegResampler();
 
-    geminiInPcmChunks = [];
+    geminiFrameCarry = Buffer.alloc(0);
     outboundMulawQueue = [];
 
     if (geminiSession) {
