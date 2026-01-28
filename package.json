@@ -1,0 +1,17 @@
+{
+  "name": "meeting-bot",
+  "version": "1.0.0",
+  "description": "Express app with Twilio outbound calls and WebSocket stream handling",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "twilio": "^5.3.4",
+    "ws": "^8.18.0"
+  }
+}
