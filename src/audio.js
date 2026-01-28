@@ -58,13 +58,26 @@ export function pcmToMulaw(pcmBuf) {
   return out;
 }
 
-/** Upsample PCM audio using linear interpolation */
-function upsamplePcm(pcmBuffer, fromRate, toRate) {
+/**
+ * Resample raw 16-bit PCM (little-endian) using linear interpolation.
+ *
+ * Assumes mono audio. For best results, pass properly aligned buffers
+ * (byteLength multiple of 2).
+ */
+export function resamplePcm16(pcmBuffer, fromRate, toRate) {
+  if (!Buffer.isBuffer(pcmBuffer)) {
+    throw new TypeError('resamplePcm16: pcmBuffer must be a Buffer');
+  }
   if (fromRate === toRate) return pcmBuffer;
+  if (pcmBuffer.length === 0) return pcmBuffer;
+  if (pcmBuffer.length % 2 !== 0) {
+    // Drop trailing byte (shouldn't happen for int16 PCM)
+    pcmBuffer = pcmBuffer.subarray(0, pcmBuffer.length - 1);
+  }
 
   const ratio = toRate / fromRate;
   const inputSamples = pcmBuffer.length / 2;
-  const outputSamples = Math.floor(inputSamples * ratio);
+  const outputSamples = Math.max(0, Math.floor(inputSamples * ratio));
   const output = Buffer.alloc(outputSamples * 2);
 
   for (let i = 0; i < outputSamples; i++) {
@@ -222,9 +235,9 @@ export function writeWavFile(filepath, pcmBuffer, inputSampleRate = 8000) {
 
   let processedPcm = pcmBuffer;
   if (inputSampleRate < OUTPUT_SAMPLE_RATE) {
-    processedPcm = upsamplePcm(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
+    processedPcm = resamplePcm16(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
   } else if (inputSampleRate > OUTPUT_SAMPLE_RATE) {
-    processedPcm = upsamplePcm(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
+    processedPcm = resamplePcm16(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
   }
 
   if (enableNoiseReduction) {

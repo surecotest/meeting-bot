@@ -10,9 +10,9 @@ import {
   OUTPUT_SAMPLE_RATE,
   ensureRecordingsDir,
   mulawToPcm,
-  generateTtsAudio,
   writeWavFile,
 } from './audio.js';
+import { createGeminiLiveTranslator } from './geminiLive.js';
 
 const app = express();
 app.use(express.json());
@@ -41,8 +41,12 @@ wss.on('connection', (ws, req) => {
     streamSid: null,
     pcmChunks: [],
     saveTimer: null,
-    outboundTimer: null, // Timer for sending audio every 5 seconds
   };
+
+  const gemini = createGeminiLiveTranslator({
+    ws,
+    getStreamSid: () => connState.streamSid,
+  });
 
   function flushToFile() {
     if (!connState.streamSid || connState.pcmChunks.length === 0) return;
@@ -60,58 +64,12 @@ wss.on('connection', (ws, req) => {
     }
   }
 
-  function sendOutboundAudio() {
-    if (!connState.streamSid || ws.readyState !== ws.OPEN) return;
-    
-    const mulaw = generateTtsAudio();
-    const payload = mulaw.toString('base64');
-    
-    // Split into chunks (Twilio recommends ~160 bytes per message for 20ms of audio)
-    const chunkSize = 160; // ~20ms at 8kHz
-    for (let i = 0; i < mulaw.length; i += chunkSize) {
-      const chunk = mulaw.slice(i, i + chunkSize);
-      const chunkPayload = chunk.toString('base64');
-      
-      const mediaMsg = {
-        event: 'media',
-        streamSid: connState.streamSid,
-        media: {
-          payload: chunkPayload,
-        },
-      };
-      
-      try {
-        ws.send(JSON.stringify(mediaMsg));
-      } catch (e) {
-        console.error('[stream] Error sending outbound audio', e);
-        return;
-      }
-    }
-    
-    // Send mark to track playback completion
-    const markMsg = {
-      event: 'mark',
-      streamSid: connState.streamSid,
-      mark: {
-        name: `tts_${Date.now()}`,
-      },
-    };
-    try {
-      ws.send(JSON.stringify(markMsg));
-    } catch (e) {
-      console.error('[stream] Error sending mark', e);
-    }
-  }
-
   function stopRecording() {
     if (connState.saveTimer) {
       clearInterval(connState.saveTimer);
       connState.saveTimer = null;
     }
-    if (connState.outboundTimer) {
-      clearInterval(connState.outboundTimer);
-      connState.outboundTimer = null;
-    }
+    gemini.stop();
     flushToFile();
   }
 
@@ -125,9 +83,8 @@ wss.on('connection', (ws, req) => {
         case 'start':
           connState.streamSid = msg.streamSid;
           connState.saveTimer = setInterval(flushToFile, RECORD_INTERVAL_MS);
-          // Send "Hi Thank you" every 5 seconds
-          connState.outboundTimer = setInterval(sendOutboundAudio, 5000);
-          // Send immediately on start
+          gemini.start();
+
           console.log('[stream] start', {
             streamSid: msg.streamSid,
             callSid: msg.start?.callSid,
@@ -140,6 +97,7 @@ wss.on('connection', (ws, req) => {
             const mulaw = Buffer.from(msg.media.payload, 'base64');
             const pcm = mulawToPcm(mulaw);
             connState.pcmChunks.push(pcm);
+            gemini.handleInboundPcm(pcm, msg.media?.track);
           }
           break;
         case 'stop':
