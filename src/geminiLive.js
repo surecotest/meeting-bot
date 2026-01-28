@@ -1,5 +1,6 @@
 import { GoogleGenAI, Modality } from '@google/genai';
 import { pcmToMulaw, resamplePcm16 } from './audio.js';
+import { spawn } from 'child_process';
 
 const clientsByKey = new Map();
 
@@ -14,9 +15,9 @@ function getClient(apiKey) {
 /**
  * Create a per-connection Gemini Live translator that:
  * - accepts inbound PCM16 @ 8kHz (Twilio decoded)
- * - streams it to Gemini as PCM16 @ 16kHz
+ * - streams it to Gemini as PCM16 @ 8kHz (no resampling)
  * - receives Gemini native audio output PCM16 @ 24kHz
- * - converts to Twilio μ-law 8kHz and sends to the Twilio websocket
+ * - resamples once (high-quality) to PCM16 @ 8kHz, converts to μ-law, and sends to Twilio
  */
 export function createGeminiLiveTranslator({
   ws,
@@ -36,6 +37,142 @@ export function createGeminiLiveTranslator({
 
   let outboundMulawQueue = [];
   let outboundPlaybackTimer = null;
+
+  let ffmpegResampler = null;
+  let ffmpegUnavailable = false;
+  let ffmpegPcmCarry = Buffer.alloc(0);
+  let outboundPcm8kRemainder = Buffer.alloc(0);
+  let fallbackPcm24kBuffer = Buffer.alloc(0);
+
+  const OUT_SAMPLE_RATE = 8000;
+  const FRAME_SAMPLES = 160; // 20ms @ 8kHz
+  const FRAME_BYTES_PCM16 = FRAME_SAMPLES * 2; // 320 bytes
+  const FALLBACK_MIN_CHUNK_MS = 250;
+  const FALLBACK_MIN_CHUNK_BYTES_24K = Math.floor((24000 * FALLBACK_MIN_CHUNK_MS) / 1000) * 2; // 4800 bytes
+
+  function enqueueOutboundPcm8k(pcm8k) {
+    if (!pcm8k || pcm8k.length === 0) return;
+
+    // Ensure int16 alignment.
+    if (pcm8k.length % 2 !== 0) {
+      pcm8k = pcm8k.subarray(0, pcm8k.length - 1);
+      if (pcm8k.length === 0) return;
+    }
+
+    let buf =
+      outboundPcm8kRemainder.length > 0 ? Buffer.concat([outboundPcm8kRemainder, pcm8k]) : pcm8k;
+
+    let offset = 0;
+    while (offset + FRAME_BYTES_PCM16 <= buf.length) {
+      const framePcm = buf.subarray(offset, offset + FRAME_BYTES_PCM16);
+      const frameMulaw = pcmToMulaw(framePcm); // 160 bytes
+      outboundMulawQueue.push(frameMulaw);
+      offset += FRAME_BYTES_PCM16;
+    }
+
+    outboundPcm8kRemainder = buf.subarray(offset);
+    if (outboundMulawQueue.length > 0) ensureOutboundPlayback();
+  }
+
+  function flushOutboundPcmRemainderWithSilence() {
+    if (!outboundPcm8kRemainder || outboundPcm8kRemainder.length === 0) return;
+    // Pad ONCE (at stop) to a full 20ms PCM16 frame before encoding.
+    const padded = Buffer.concat([
+      outboundPcm8kRemainder,
+      Buffer.alloc(FRAME_BYTES_PCM16 - outboundPcm8kRemainder.length),
+    ]);
+    outboundPcm8kRemainder = Buffer.alloc(0);
+    enqueueOutboundPcm8k(padded);
+  }
+
+  function startFfmpegResampler() {
+    if (ffmpegResampler || ffmpegUnavailable) return;
+
+    try {
+      ffmpegResampler = spawn(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          // Input: PCM16LE mono @ 24kHz
+          '-f',
+          's16le',
+          '-ar',
+          '24000',
+          '-ac',
+          '1',
+          '-i',
+          'pipe:0',
+          // Output: PCM16LE mono @ 8kHz
+          '-f',
+          's16le',
+          '-ar',
+          '8000',
+          '-ac',
+          '1',
+          'pipe:1',
+        ],
+        { stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+    } catch (e) {
+      ffmpegUnavailable = true;
+      ffmpegResampler = null;
+      return;
+    }
+
+    ffmpegResampler.on('error', (err) => {
+      // e.g. ENOENT if ffmpeg isn't installed
+      console.warn('[gemini] ffmpeg resampler unavailable, falling back to linear resample:', err?.message ?? err);
+      ffmpegUnavailable = true;
+      stopFfmpegResampler();
+    });
+
+    ffmpegResampler.on('close', (code, signal) => {
+      if (ffmpegUnavailable) return;
+      if (code === 0) return;
+      console.warn('[gemini] ffmpeg resampler exited, falling back to linear resample:', { code, signal });
+      ffmpegUnavailable = true;
+      stopFfmpegResampler();
+    });
+
+    ffmpegResampler.stdout.on('data', (chunk) => {
+      // Ensure 16-bit alignment before framing/encoding.
+      let buf = ffmpegPcmCarry.length ? Buffer.concat([ffmpegPcmCarry, chunk]) : chunk;
+      if (buf.length % 2 !== 0) {
+        ffmpegPcmCarry = buf.subarray(buf.length - 1);
+        buf = buf.subarray(0, buf.length - 1);
+      } else {
+        ffmpegPcmCarry = Buffer.alloc(0);
+      }
+
+      if (buf.length === 0) return;
+      enqueueOutboundPcm8k(buf);
+    });
+  }
+
+  function stopFfmpegResampler() {
+    ffmpegPcmCarry = Buffer.alloc(0);
+    if (!ffmpegResampler) return;
+    try {
+      ffmpegResampler.stdin?.end?.();
+    } catch (_) {}
+    try {
+      ffmpegResampler.kill('SIGKILL');
+    } catch (_) {}
+    ffmpegResampler = null;
+  }
+
+  function resetOutboundAudioPipeline() {
+    outboundMulawQueue = [];
+    outboundPcm8kRemainder = Buffer.alloc(0);
+    fallbackPcm24kBuffer = Buffer.alloc(0);
+    stopOutboundPlayback();
+    stopFfmpegResampler();
+    // Allow retrying ffmpeg if it exited unexpectedly but is installed.
+    // If it's genuinely unavailable (ENOENT), we'll keep the fallback.
+    ffmpegPcmCarry = Buffer.alloc(0);
+  }
 
   function logMissingKeyOnce() {
     if (warnedMissingKey) return;
@@ -65,57 +202,29 @@ export function createGeminiLiveTranslator({
       stopOutboundPlayback();
       return;
     }
-    if (!geminiSession) {
-      stopOutboundPlayback();
-      return;
-    }
     if (outboundMulawQueue.length === 0) {
       stopOutboundPlayback();
       return;
     }
 
-    // Twilio expects ~20ms frames => 160 bytes per message (μ-law 8kHz, 1 byte/sample)
-    const frameSize = 160;
-    const parts = [];
-    let remaining = frameSize;
-    while (remaining > 0 && outboundMulawQueue.length > 0) {
-      const head = outboundMulawQueue[0];
-      const take = Math.min(head.length, remaining);
-      parts.push(head.subarray(0, take));
-      if (take === head.length) {
-        outboundMulawQueue.shift();
-      } else {
-        outboundMulawQueue[0] = head.subarray(take);
-      }
-      remaining -= take;
-    }
-
-    if (parts.length === 0) {
+    // EXACTLY one 20ms frame (μ-law 8kHz: 160 bytes)
+    const frame = outboundMulawQueue.shift();
+    if (!frame) {
       stopOutboundPlayback();
       return;
     }
-
-    let frame = Buffer.concat(parts);
-    if (frame.length < frameSize) {
-      // Pad final frame with μ-law silence (0x7f)
-      frame = Buffer.concat([frame, Buffer.alloc(frameSize - frame.length, 0x7f)]);
-    }
-
-    const mediaMsg = {
-      event: 'media',
-      streamSid,
-      media: {
-        payload: frame.toString('base64'),
-      },
-    };
-
-    try {
-      ws.send(JSON.stringify(mediaMsg));
-    } catch (e) {
-      console.error('[stream] Error sending outbound audio', e);
-      stopOutboundPlayback();
+    if (frame.length !== 160) {
+      console.warn('[audio] bad μ-law frame size:', frame.length);
       return;
     }
+
+    ws.send(
+      JSON.stringify({
+        event: 'media',
+        streamSid,
+        media: { payload: frame.toString('base64') },
+      })
+    );
 
     // If we just drained the queue, send a single mark and stop playback.
     if (outboundMulawQueue.length === 0) {
@@ -161,7 +270,7 @@ export function createGeminiLiveTranslator({
           onmessage: (message) => {
             try {
               if (message?.serverContent?.interrupted) {
-                outboundMulawQueue = [];
+                resetOutboundAudioPipeline();
                 return;
               }
 
@@ -169,10 +278,27 @@ export function createGeminiLiveTranslator({
               if (message?.data) {
                 const pcm24k = Buffer.from(message.data, 'base64');
                 if (pcm24k.length > 0) {
-                  const pcm8k = resamplePcm16(pcm24k, 24000, 8000);
-                  const mulaw8k = pcmToMulaw(pcm8k);
-                  outboundMulawQueue.push(mulaw8k);
-                  ensureOutboundPlayback();
+                  if (!ffmpegUnavailable) {
+                    startFfmpegResampler();
+                  }
+
+                  if (ffmpegResampler?.stdin?.writable && !ffmpegUnavailable) {
+                    ffmpegResampler.stdin.write(pcm24k);
+                  } else {
+                    // Fallback (lower quality): linear resample in JS
+                    // Buffer and resample in larger chunks to reduce zipper noise.
+                    fallbackPcm24kBuffer = Buffer.concat([fallbackPcm24kBuffer, pcm24k]);
+                    // Keep alignment.
+                    if (fallbackPcm24kBuffer.length % 2 !== 0) {
+                      fallbackPcm24kBuffer = fallbackPcm24kBuffer.subarray(0, fallbackPcm24kBuffer.length - 1);
+                    }
+                    while (fallbackPcm24kBuffer.length >= FALLBACK_MIN_CHUNK_BYTES_24K) {
+                      const chunk24k = fallbackPcm24kBuffer.subarray(0, FALLBACK_MIN_CHUNK_BYTES_24K);
+                      fallbackPcm24kBuffer = fallbackPcm24kBuffer.subarray(FALLBACK_MIN_CHUNK_BYTES_24K);
+                      const pcm8k = resamplePcm16(chunk24k, 24000, OUT_SAMPLE_RATE);
+                      enqueueOutboundPcm8k(pcm8k);
+                    }
+                  }
                 }
               }
 
@@ -214,14 +340,13 @@ export function createGeminiLiveTranslator({
 
     const pcm8k = Buffer.concat(geminiInPcmChunks);
     geminiInPcmChunks = [];
-    const pcm16k = resamplePcm16(pcm8k, 8000, 16000);
-    if (pcm16k.length === 0) return;
+    if (pcm8k.length === 0) return;
 
     try {
       geminiSession.sendRealtimeInput({
         audio: {
-          data: pcm16k.toString('base64'),
-          mimeType: 'audio/pcm;rate=16000',
+          data: pcm8k.toString('base64'),
+          mimeType: 'audio/pcm;rate=8000',
         },
       });
     } catch (e) {
@@ -267,6 +392,8 @@ export function createGeminiLiveTranslator({
       geminiInFlushTimer = null;
     }
     stopOutboundPlayback();
+    flushOutboundPcmRemainderWithSilence();
+    stopFfmpegResampler();
 
     geminiInPcmChunks = [];
     outboundMulawQueue = [];

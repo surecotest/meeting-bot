@@ -74,3 +74,4 @@ curl -X POST http://localhost:3000/call \
 | `TWILIO_AUTH_TOKEN` | Twilio Auth Token |
 | `TWILIO_PHONE_NUMBER` | Twilio number used as “from” |
 | `LOG_MEDIA_CHUNKS` | Set to `1` to log every media chunk (verbose) |
+| `RECORD_CODEC` | Recording format: `pcm` (default), `mulaw`, or `both` |

@@ -7,9 +7,9 @@ import path from 'path';
 import {
   RECORDINGS_DIR,
   RECORD_INTERVAL_MS,
-  OUTPUT_SAMPLE_RATE,
   ensureRecordingsDir,
   mulawToPcm,
+  writeMulawWavFile,
   writeWavFile,
 } from './audio.js';
 import { createGeminiLiveTranslator } from './geminiLive.js';
@@ -40,6 +40,7 @@ wss.on('connection', (ws, req) => {
   const connState = {
     streamSid: null,
     pcmChunks: [],
+    mulawChunks: [],
     saveTimer: null,
   };
 
@@ -49,16 +50,33 @@ wss.on('connection', (ws, req) => {
   });
 
   function flushToFile() {
-    if (!connState.streamSid || connState.pcmChunks.length === 0) return;
+    if (!connState.streamSid) return;
+    if (connState.pcmChunks.length === 0 && connState.mulawChunks.length === 0) return;
     ensureRecordingsDir();
-    const pcm = Buffer.concat(connState.pcmChunks);
+    const pcm = connState.pcmChunks.length ? Buffer.concat(connState.pcmChunks) : Buffer.alloc(0);
+    const mulaw = connState.mulawChunks.length ? Buffer.concat(connState.mulawChunks) : Buffer.alloc(0);
     connState.pcmChunks = [];
-    const filename = `stream_${connState.streamSid}_${Date.now()}.wav`;
-    const filepath = path.join(RECORDINGS_DIR, filename);
+    connState.mulawChunks = [];
+
+    const sampleRate = 8000; // Twilio inbound is 8kHz μ-law
+    const recordCodec = (process.env.RECORD_CODEC || 'pcm').toLowerCase(); // pcm | mulaw | both
+    const base = `stream_${connState.streamSid}_${Date.now()}`;
     try {
-      writeWavFile(filepath, pcm, 8000); // Input is 8kHz from Twilio
-      const duration = (pcm.length / 16000).toFixed(1); // Original duration
-      console.log('[stream] wrote', filename, `${duration}s @ ${OUTPUT_SAMPLE_RATE}Hz`);
+      if (recordCodec === 'mulaw' || recordCodec === 'both') {
+        const filename = `${base}_mulaw.wav`;
+        const filepath = path.join(RECORDINGS_DIR, filename);
+        writeMulawWavFile(filepath, mulaw, sampleRate);
+        const duration = (mulaw.length / sampleRate).toFixed(1);
+        console.log('[stream] wrote', filename, `${duration}s @ ${sampleRate}Hz (μ-law)`);
+      }
+
+      if (recordCodec === 'pcm' || recordCodec === 'both') {
+        const filename = recordCodec === 'both' ? `${base}_pcm.wav` : `${base}.wav`;
+        const filepath = path.join(RECORDINGS_DIR, filename);
+        writeWavFile(filepath, pcm, sampleRate);
+        const duration = (pcm.length / 16000).toFixed(1); // bytes/sec for PCM16 @ 8kHz
+        console.log('[stream] wrote', filename, `${duration}s @ ${sampleRate}Hz (PCM16)`);
+      }
     } catch (e) {
       console.error('[stream] write error', e);
     }
@@ -97,6 +115,7 @@ wss.on('connection', (ws, req) => {
             const mulaw = Buffer.from(msg.media.payload, 'base64');
             const pcm = mulawToPcm(mulaw);
             connState.pcmChunks.push(pcm);
+            connState.mulawChunks.push(mulaw);
             gemini.handleInboundPcm(pcm, msg.media?.track);
           }
           break;

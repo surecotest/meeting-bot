@@ -9,6 +9,19 @@ export const RECORD_INTERVAL_MS = 60 * 1000; // 1 minute
 export const OUTPUT_SAMPLE_RATE = parseInt(process.env.OUTPUT_SAMPLE_RATE) || 16000;
 export const OUTPUT_BIT_DEPTH = 16;
 
+// Canonical G.711 μ-law decode table (256 entries).
+// Twilio Media Streams provides audio as 8kHz μ-law (8-bit) in base64.
+const MULAW_DECODE_TABLE = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  const u = (~i) & 0xff;
+  const sign = (u & 0x80) ? -1 : 1;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  MULAW_DECODE_TABLE[i] = sign * sample;
+}
+
 export function ensureRecordingsDir() {
   try {
     fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
@@ -17,18 +30,9 @@ export function ensureRecordingsDir() {
 
 /** G.711 μ-law expand to 16-bit PCM (little-endian) */
 export function mulawToPcm(mulawBuf) {
-  const MULAW_BIAS = 0x84;
-  const out = Buffer.alloc(mulawBuf.length * 2);
+  const out = Buffer.allocUnsafe(mulawBuf.length * 2);
   for (let i = 0; i < mulawBuf.length; i++) {
-    let u = ~mulawBuf[i];
-    const sign = (u & 0x80) ? -1 : 1;
-    const exponent = (u >> 4) & 0x07;
-    const mantissa = u & 0x0f;
-    let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
-    sample -= MULAW_BIAS << exponent;
-    if (exponent === 0) sample -= 0xff;
-    sample = Math.max(-0x7f7b, Math.min(0x7f7b, sign * sample));
-    out.writeInt16LE(sample, i * 2);
+    out.writeInt16LE(MULAW_DECODE_TABLE[mulawBuf[i]], i * 2);
   }
   return out;
 }
@@ -37,9 +41,10 @@ export function mulawToPcm(mulawBuf) {
 export function pcmToMulaw(pcmBuf) {
   const MULAW_BIAS = 0x84;
   const MULAW_MAX = 32635; // 0x7f7b
+  const clamp16 = (x) => Math.max(-32768, Math.min(32767, x));
   const out = Buffer.alloc(pcmBuf.length / 2);
   for (let i = 0; i < out.length; i++) {
-    let sample = pcmBuf.readInt16LE(i * 2);
+    let sample = clamp16(pcmBuf.readInt16LE(i * 2));
     const sign = (sample >>> 15) & 0x01;
     if (sample < 0) sample = -sample;
     if (sample > MULAW_MAX) sample = MULAW_MAX;
@@ -56,6 +61,54 @@ export function pcmToMulaw(pcmBuf) {
     out[i] = ~mulaw;
   }
   return out;
+}
+
+/**
+ * Write a mono μ-law WAV file (WAVE_FORMAT_MULAW, 8-bit samples).
+ *
+ * This preserves the exact bytes received from Twilio Media Streams
+ * (`audio/x-mulaw` @ 8kHz), without decoding to PCM.
+ */
+export function writeMulawWavFile(filepath, mulawBuffer, sampleRate = 8000) {
+  const numChannels = 1;
+  const bitsPerSample = 8;
+  const audioFormat = 7; // WAVE_FORMAT_MULAW
+
+  const dataSize = mulawBuffer.length;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const sampleLength = dataSize; // 1 byte per sample @ 8kHz mono
+
+  // WAV header with:
+  // - fmt  (18 bytes for non-PCM, cbSize=0)
+  // - fact (required for non-PCM; 4-byte sample length)
+  // - data
+  const header = Buffer.alloc(58);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(58 - 8 + dataSize, 4); // fileSize - 8
+  header.write('WAVE', 8);
+
+  // fmt chunk
+  header.write('fmt ', 12);
+  header.writeUInt32LE(18, 16); // fmt chunk size
+  header.writeUInt16LE(audioFormat, 20); // WAVE_FORMAT_MULAW
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.writeUInt16LE(0, 36); // cbSize
+
+  // fact chunk
+  header.write('fact', 38);
+  header.writeUInt32LE(4, 42);
+  header.writeUInt32LE(sampleLength, 46);
+
+  // data chunk
+  header.write('data', 50);
+  header.writeUInt32LE(dataSize, 54);
+
+  fs.writeFileSync(filepath, Buffer.concat([header, mulawBuffer]));
 }
 
 /**
@@ -95,65 +148,6 @@ export function resamplePcm16(pcmBuffer, fromRate, toRate) {
   return output;
 }
 
-/** Apply noise reduction: noise gate, smoothing, and normalization */
-function enhanceAudio(pcmBuffer) {
-  const samples = pcmBuffer.length / 2;
-  const NOISE_GATE_THRESHOLD = 500;
-  const SMOOTHING_WINDOW = 3;
-  const NOISE_REDUCTION_FACTOR = 0.3;
-
-  let sumSquared = 0;
-  let peakAmplitude = 0;
-
-  for (let i = 0; i < samples; i++) {
-    const sample = pcmBuffer.readInt16LE(i * 2);
-    const absSample = Math.abs(sample);
-    sumSquared += sample * sample;
-    if (absSample > peakAmplitude) peakAmplitude = absSample;
-  }
-
-  const rms = Math.sqrt(sumSquared / samples);
-  const noiseFloor = rms * 0.1;
-
-  const output = Buffer.alloc(pcmBuffer.length);
-  const window = [];
-
-  for (let i = 0; i < samples; i++) {
-    let sample = pcmBuffer.readInt16LE(i * 2);
-    const absSample = Math.abs(sample);
-
-    if (absSample < NOISE_GATE_THRESHOLD) {
-      sample = 0;
-    } else {
-      const noiseReduction = Math.max(0, absSample - noiseFloor * NOISE_REDUCTION_FACTOR);
-      sample = sample > 0 ? noiseReduction : -noiseReduction;
-    }
-
-    window.push(sample);
-    if (window.length > SMOOTHING_WINDOW) {
-      window.shift();
-    }
-
-    const smoothed = window.reduce((sum, s) => sum + s, 0) / window.length;
-    sample = Math.round(smoothed);
-    sample = Math.max(-32767, Math.min(32767, sample));
-
-    output.writeInt16LE(sample, i * 2);
-  }
-
-  if (peakAmplitude > 100) {
-    const normalizeFactor = (32767 * 0.85) / peakAmplitude;
-    for (let i = 0; i < samples; i++) {
-      let sample = output.readInt16LE(i * 2);
-      sample = Math.round(sample * normalizeFactor);
-      sample = Math.max(-32767, Math.min(32767, sample));
-      output.writeInt16LE(sample, i * 2);
-    }
-  }
-
-  return output;
-}
-
 /** Generate TTS audio "Hi Thank you" and return as μ-law 8kHz buffer */
 let cachedAudio = null;
 export function generateTtsAudio() {
@@ -165,7 +159,7 @@ export function generateTtsAudio() {
   } catch (_) {}
 
   const tempAiff = path.join(tempDir, 'tts_temp.aiff');
-  const temp8k = path.join(tempDir, 'tts_8k.wav');
+  const temp8k = path.join(tempDir, 'tts_8k.pcm');
 
   try {
     let sayCmd = `say -v Samantha "Hi Thank you" -o "${tempAiff}"`;
@@ -181,12 +175,14 @@ export function generateTtsAudio() {
     }
 
     try {
-      execSync(`ffmpeg -i "${tempAiff}" -ar 8000 -ac 1 -f wav "${temp8k}" -y`, {
+      // Force raw PCM16LE mono @ 8kHz (avoid WAV headers / float formats / extra chunks)
+      execSync(`ffmpeg -y -i "${tempAiff}" -f s16le -ar 8000 -ac 1 "${temp8k}"`, {
         stdio: ['ignore', 'ignore', 'pipe'],
       });
     } catch (ffmpegErr) {
       try {
-        execSync(`sox "${tempAiff}" -r 8000 -c 1 "${temp8k}"`, {
+        // Equivalent raw PCM16LE mono @ 8kHz with sox
+        execSync(`sox "${tempAiff}" -t raw -r 8000 -c 1 -e signed-integer -b 16 -L "${temp8k}"`, {
           stdio: ['ignore', 'ignore', 'pipe'],
         });
       } catch (soxErr) {
@@ -200,13 +196,9 @@ export function generateTtsAudio() {
       throw new Error('Audio conversion did not create output file');
     }
 
-    const wavData = fs.readFileSync(temp8k);
-    if (wavData.length < 44) {
-      throw new Error('WAV file too small');
-    }
-    const pcmData = wavData.slice(44);
+    const pcmData = fs.readFileSync(temp8k);
     if (pcmData.length === 0) {
-      throw new Error('WAV file has no audio data');
+      throw new Error('PCM file has no audio data');
     }
     const mulaw = pcmToMulaw(pcmData);
 
@@ -227,24 +219,17 @@ export function generateTtsAudio() {
   }
 }
 
-/** Write high-quality WAV file with optional upsampling and enhancement */
-export function writeWavFile(filepath, pcmBuffer, inputSampleRate = 8000) {
+/** Write a mono PCM16 WAV file (no enhancement, no resampling). */
+export function writeWavFile(filepath, pcmBuffer, sampleRate = 8000) {
   const numChannels = 1;
   const bitsPerSample = OUTPUT_BIT_DEPTH;
-  const enableNoiseReduction = process.env.ENABLE_NOISE_REDUCTION !== 'false';
 
+  // Ensure int16 alignment
   let processedPcm = pcmBuffer;
-  if (inputSampleRate < OUTPUT_SAMPLE_RATE) {
-    processedPcm = resamplePcm16(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
-  } else if (inputSampleRate > OUTPUT_SAMPLE_RATE) {
-    processedPcm = resamplePcm16(pcmBuffer, inputSampleRate, OUTPUT_SAMPLE_RATE);
+  if (processedPcm.length % 2 !== 0) {
+    processedPcm = processedPcm.subarray(0, processedPcm.length - 1);
   }
 
-  if (enableNoiseReduction) {
-    processedPcm = enhanceAudio(processedPcm);
-  }
-
-  const sampleRate = OUTPUT_SAMPLE_RATE;
   const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
   const blockAlign = numChannels * (bitsPerSample / 8);
   const dataSize = processedPcm.length;
