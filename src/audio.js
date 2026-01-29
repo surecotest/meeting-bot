@@ -148,8 +148,13 @@ export function resamplePcm16(pcmBuffer, fromRate, toRate) {
   return output;
 }
 
-/** Generate TTS audio for arbitrary text and return as μ-law 8kHz buffer */
-export function generateTtsAudioForText(text) {
+/** Generate TTS audio for arbitrary text and return as μ-law 8kHz buffer
+ * @param {string} text - Text to speak
+ * @param {object} options - Optional settings
+ * @param {string} options.voice - macOS voice name (e.g., 'Kanya' for Thai, 'Samantha' for English)
+ * @param {string} options.lang - Language shorthand: 'th' for Thai (uses Kanya), 'en' for English
+ */
+export function generateTtsAudioForText(text, options = {}) {
   if (!text || typeof text !== 'string' || text.trim() === '') {
     return Buffer.alloc(0);
   }
@@ -162,11 +167,26 @@ export function generateTtsAudioForText(text) {
   const temp8k = path.join(tempDir, `tts_${Date.now()}.pcm`);
   const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+  // Determine voice: explicit voice > lang shorthand > default
+  let voice = options.voice;
+  if (!voice && options.lang) {
+    const langVoiceMap = {
+      th: 'Kanya',      // Thai
+      en: 'Samantha',   // English (US)
+      ja: 'Kyoko',      // Japanese
+      zh: 'Tingting',   // Chinese (Mandarin)
+      ko: 'Yuna',       // Korean
+    };
+    voice = langVoiceMap[options.lang.toLowerCase()];
+  }
+
   try {
-    let sayCmd = `say "${escaped}" -o "${tempAiff}"`;
+    const voiceArg = voice ? `-v "${voice}"` : '';
+    let sayCmd = `say ${voiceArg} "${escaped}" -o "${tempAiff}"`;
     try {
       execSync(sayCmd, { stdio: ['ignore', 'ignore', 'pipe'] });
     } catch {
+      // Fallback without voice if specified voice not available
       sayCmd = `say "${escaped}" -o "${tempAiff}"`;
       execSync(sayCmd, { stdio: ['ignore', 'ignore', 'pipe'] });
     }

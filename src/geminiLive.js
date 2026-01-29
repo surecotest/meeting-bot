@@ -318,11 +318,16 @@ export function createGeminiLiveTranslator({
 
   const FRAME_BYTES_MULAW = 160; // 20ms @ 8kHz μ-law
 
-  /** Play TTS phrase to the call (enqueues μ-law and starts playback). */
-  function playTts(text) {
+  /** Play TTS phrase to the call (enqueues μ-law and starts playback).
+   * @param {string} text - Text to speak
+   * @param {object} options - Optional settings
+   * @param {string} options.lang - Language: 'th' for Thai, 'en' for English
+   * @param {string} options.voice - macOS voice name (overrides lang)
+   */
+  function playTts(text, options = {}) {
     if (!text || !getStreamSid?.() || ws?.readyState !== 1) return;
     try {
-      const mulaw = generateTtsAudioForText(text);
+      const mulaw = generateTtsAudioForText(text, options);
       if (mulaw.length === 0) return;
       for (let i = 0; i < mulaw.length; i += FRAME_BYTES_MULAW) {
         const frame = mulaw.subarray(i, i + FRAME_BYTES_MULAW);
@@ -349,9 +354,11 @@ export function createGeminiLiveTranslator({
       responseModalities: [Modality.AUDIO],
       outputAudioTranscription: {},
       thinkingConfig: { thinkingBudget: 0 },
-      systemInstruction:
+      systemInstruction:'You are a real-time interpreter. Listen to the caller speaking English and respond with spoken Thai only. ' +
+        'Do not repeat the English. Do not add commentary. Keep the translation concise and natural.',
+      /*systemInstruction:
         'You are a real-time interpreter. Listen to the caller speaking Thai (th-TH) and respond with spoken English only. ' +
-        'Do not repeat the Thai. Do not add commentary. Keep the translation concise and natural.',
+        'Do not repeat the Thai. Do not add commentary. Keep the translation concise and natural.',*/
     };
 
     geminiConnectPromise = geminiClient.live
@@ -366,14 +373,14 @@ export function createGeminiLiveTranslator({
           },
           onmessage: (message) => {
             try {
-              if (message?.serverContent?.interrupted) {
+              /*if (message?.serverContent?.interrupted) {
                 currentTurnTranscript = '';
                 resetOutboundAudioPipeline();
                 return;
-              }
+              }*/
 
               // Native audio output arrives as base64 PCM16 @ 24kHz in message.data
-              /*if (message?.data) {
+              if (message?.data) {
                 const tMsg = nowMs();
                 const pcm24k = Buffer.from(message.data, 'base64');
                 if (pcm24k.length > 0) {
@@ -398,7 +405,7 @@ export function createGeminiLiveTranslator({
                     }
                   }
                 }
-              }*/
+              }
 
               // Accumulate output transcription (English) during the turn
               if (message?.serverContent?.outputTranscription?.text) {
@@ -413,7 +420,7 @@ export function createGeminiLiveTranslator({
               if (message?.serverContent?.turnComplete === true) {
                 console.log('[gemini] EN (end of response)');
                 if (currentTurnTranscript.trim()) {
-                  playTts(currentTurnTranscript.trim());
+                  // playTts(currentTurnTranscript.trim(), { lang: 'th' });
                 }
                 currentTurnTranscript = '';
               }
