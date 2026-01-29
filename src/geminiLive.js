@@ -235,13 +235,6 @@ export function createGeminiLiveTranslator({
         });
         lastGeminiSendAt = t0;
         lastGeminiSendBytes = frame.length;
-        if (lastInboundPcmAt) {
-          logLatency('gemini_send', {
-            ms_since_inbound: +(t0 - lastInboundPcmAt).toFixed(1),
-            inbound_bytes: lastInboundBytes,
-            sent_bytes: frame.length,
-          });
-        }
       } catch (e) {
         console.error('[gemini] sendRealtimeInput error', e?.message ?? e);
         // Keep going; best-effort streaming.
