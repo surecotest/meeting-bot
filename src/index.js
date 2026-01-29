@@ -33,17 +33,26 @@ const twilioClient =
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/stream' });
 
-wss.on('connection', (ws, req) => {
-  const connState = {
-    streamSid: null,
-  };
+const connState = {
+  streamSid: null,
+};
 
-  const gemini = createGeminiLiveTranslator({
+// let wsConnection = null
+let gemini = null
+let mode = 'main-menu' // translation | summary | main-menu
+
+wss.on('connection', (ws, req) => {
+  // wsConnection = ws;
+  // Recording is intentionally disabled (to minimize latency).
+  /*const gemini = createGeminiLiveTranslator({
+    ws,
+    getStreamSid: () => connState.streamSid,
+  });*/
+  gemini = createGeminiLiveTranslator({
     ws,
     getStreamSid: () => connState.streamSid,
   });
-
-  // Recording is intentionally disabled (to minimize latency).
+  
   function stopStream() {
     gemini.stop();
   }
@@ -57,7 +66,7 @@ wss.on('connection', (ws, req) => {
           break;
         case 'start':
           connState.streamSid = msg.streamSid;
-          gemini.start();
+          // gemini.start();
 
           console.log('[stream] start', {
             streamSid: msg.streamSid,
@@ -65,12 +74,18 @@ wss.on('connection', (ws, req) => {
             tracks: msg.start?.tracks,
             mediaFormat: msg.start?.mediaFormat,
           });
+
+          setTimeout(() => {
+            gemini.playTts(`Welcome to the translation service by Scam Meets AI. How can I help you today?`);
+          }, 20000);
           break;
         case 'media':
           if (msg.media?.payload) {
             const mulaw = Buffer.from(msg.media.payload, 'base64');
             const pcm = mulawToPcm(mulaw);
-            gemini.handleInboundPcm(pcm, msg.media?.track);
+            if (mode === 'translation') {
+              gemini.handleInboundPcm(pcm, msg.media?.track);
+            }
           }
           break;
         case 'stop':
@@ -199,7 +214,7 @@ app.post('/call/zoom', async (req, res) => {
     const twiml = `
       <Response>
         <Start>
-          <Transcription statusCallbackUrl="${BASE_URL}/transcribe"/> 
+          <Transcription statusCallbackUrl="${BASE_URL}/transcribe" transcriptionEngine="deepgram" speechModel="nova-2" profanityFilter="false" /> 
         </Start>   
         <Pause length="1" />
         <Play digits="${meetingIdStr}#"></Play>
@@ -234,8 +249,25 @@ app.all('/transcribe', (req, res) => {
     try {
       const data = typeof transcriptionDataRaw === 'string' ? JSON.parse(transcriptionDataRaw) : transcriptionDataRaw;
       const transcript = data?.transcript;
-      if (transcript != null && transcript !== '') {
-        console.log('Transcribe: ' + transcript);
+      const track = body.Track || '';
+      const direction = track === 'inbound_track' ? 'inbound' : track === 'outbound_track' ? 'outbound' : track || 'unknown';
+      if (transcript != null && transcript !== '' && direction === 'inbound') {
+        console.log('[transcribe]', direction + ':', transcript);
+
+        if (/begin.* translation/i.test(transcript) && mode !== 'translation') {
+          console.log('[transcribe] start translation detected:', transcript);
+          gemini.start('translate');
+          mode = 'translation';
+          gemini.playTts(`Okay. Let's Begin Translation`);
+        } else if (/end.* translation/i.test(transcript) && mode === 'translation') {
+          console.log('[transcribe] end translation detected:', transcript);
+          gemini.stop();
+          mode = 'main-menu';
+          gemini.playTts(`Okay Translation is ended. What else can I help you with?`);
+        } else if (/please.* summarize/i.test(transcript) && mode !== 'summary') {
+          console.log('[transcribe] start summary detected:', transcript);
+          gemini.playTts(`Okay. Summarizing the conversation in progress...`);
+        }
       }
     } catch (e) {
       console.error('[transcribe] parse TranscriptionData error', e.message);
