@@ -33,6 +33,38 @@
       padding: 1rem 0;
       overflow-y: auto;
     }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 1rem 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 0.5rem;
+    }
+    .logo-mark {
+      flex-shrink: 0;
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent) 0%, #7c3aed 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .logo-mark svg {
+      width: 20px;
+      height: 20px;
+      color: white;
+    }
+    .logo-text {
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .logo-text span {
+      color: var(--accent);
+    }
     .sidebar h2 {
       margin: 0 1rem 0.75rem;
       font-size: 0.875rem;
@@ -167,6 +199,17 @@
 <body>
   <div class="layout">
     <aside class="sidebar">
+      <div class="logo">
+        <div class="logo-mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+        </div>
+        <span class="logo-text">Scam <span>Meet</span></span>
+      </div>
       <h2>Recordings</h2>
       <ul class="recordings-list" id="list"></ul>
       <p class="empty-list" id="emptyList" hidden>No recordings yet.</p>
