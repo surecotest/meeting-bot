@@ -148,6 +148,73 @@ export function resamplePcm16(pcmBuffer, fromRate, toRate) {
   return output;
 }
 
+/** Generate TTS audio for arbitrary text and return as μ-law 8kHz buffer */
+export function generateTtsAudioForText(text) {
+  if (!text || typeof text !== 'string' || text.trim() === '') {
+    return Buffer.alloc(0);
+  }
+  const tempDir = path.join(process.cwd(), 'temp');
+  try {
+    fs.mkdirSync(tempDir, { recursive: true });
+  } catch (_) {}
+
+  const tempAiff = path.join(tempDir, `tts_${Date.now()}.aiff`);
+  const temp8k = path.join(tempDir, `tts_${Date.now()}.pcm`);
+  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  try {
+    let sayCmd = `say "${escaped}" -o "${tempAiff}"`;
+    try {
+      execSync(sayCmd, { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch {
+      sayCmd = `say "${escaped}" -o "${tempAiff}"`;
+      execSync(sayCmd, { stdio: ['ignore', 'ignore', 'pipe'] });
+    }
+
+    if (!fs.existsSync(tempAiff)) {
+      throw new Error('say command did not create output file');
+    }
+
+    try {
+      execSync(`ffmpeg -y -i "${tempAiff}" -f s16le -ar 8000 -ac 1 "${temp8k}"`, {
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+    } catch (ffmpegErr) {
+      try {
+        execSync(`sox "${tempAiff}" -t raw -r 8000 -c 1 -e signed-integer -b 16 -L "${temp8k}"`, {
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+      } catch (soxErr) {
+        throw new Error(
+          `Audio conversion failed. ffmpeg error: ${ffmpegErr.message}, sox error: ${soxErr.message}`
+        );
+      }
+    }
+
+    if (!fs.existsSync(temp8k)) {
+      throw new Error('Audio conversion did not create output file');
+    }
+
+    const pcmData = fs.readFileSync(temp8k);
+    if (pcmData.length === 0) {
+      throw new Error('PCM file has no audio data');
+    }
+    const mulaw = pcmToMulaw(pcmData);
+
+    try {
+      fs.unlinkSync(tempAiff);
+    } catch (_) {}
+    try {
+      fs.unlinkSync(temp8k);
+    } catch (_) {}
+
+    return mulaw;
+  } catch (e) {
+    console.error('[tts] Error generating audio for text:', e.message);
+    return Buffer.alloc(8000, 0x7f);
+  }
+}
+
 /** Generate TTS audio "Hi Thank you" and return as μ-law 8kHz buffer */
 let cachedAudio = null;
 export function generateTtsAudio() {

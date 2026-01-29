@@ -1,5 +1,5 @@
 import { GoogleGenAI, Modality } from '@google/genai';
-import { pcmToMulaw } from './audio.js';
+import { pcmToMulaw, resamplePcm16, generateTtsAudioForText } from './audio.js';
 import { spawn } from 'child_process';
 
 const clientsByKey = new Map();
@@ -48,6 +48,9 @@ export function createGeminiLiveTranslator({
   let ffmpegPcmCarry = Buffer.alloc(0);
   let outboundPcm8kRemainder = Buffer.alloc(0);
   let ffmpegUnavailableLogged = false;
+
+  // Accumulate output transcription during the turn; play via TTS when turnComplete
+  let currentTurnTranscript = '';
 
   // --- latency tracing (opt-in) ---
   let lastInboundPcmAt = 0;
@@ -313,6 +316,30 @@ export function createGeminiLiveTranslator({
     outboundPlaybackTimer = null;
   }
 
+  const FRAME_BYTES_MULAW = 160; // 20ms @ 8kHz μ-law
+
+  /** Play TTS phrase to the call (enqueues μ-law and starts playback). */
+  function playTts(text) {
+    if (!text || !getStreamSid?.() || ws?.readyState !== 1) return;
+    try {
+      const mulaw = generateTtsAudioForText(text);
+      if (mulaw.length === 0) return;
+      for (let i = 0; i < mulaw.length; i += FRAME_BYTES_MULAW) {
+        const frame = mulaw.subarray(i, i + FRAME_BYTES_MULAW);
+        if (frame.length === FRAME_BYTES_MULAW) {
+          outboundMulawQueue.push(Buffer.from(frame));
+        } else if (frame.length > 0) {
+          const padded = Buffer.alloc(FRAME_BYTES_MULAW, 0x7f);
+          frame.copy(padded);
+          outboundMulawQueue.push(padded);
+        }
+      }
+      ensureOutboundPlayback();
+    } catch (e) {
+      console.error('[gemini] playTts error', e?.message ?? e);
+    }
+  }
+
   async function ensureGeminiSession() {
     if (!geminiClient) return null;
     if (geminiSession) return geminiSession;
@@ -340,12 +367,13 @@ export function createGeminiLiveTranslator({
           onmessage: (message) => {
             try {
               if (message?.serverContent?.interrupted) {
+                currentTurnTranscript = '';
                 resetOutboundAudioPipeline();
                 return;
               }
 
               // Native audio output arrives as base64 PCM16 @ 24kHz in message.data
-              if (message?.data) {
+              /*if (message?.data) {
                 const tMsg = nowMs();
                 const pcm24k = Buffer.from(message.data, 'base64');
                 if (pcm24k.length > 0) {
@@ -370,11 +398,24 @@ export function createGeminiLiveTranslator({
                     }
                   }
                 }
+              }*/
+
+              // Accumulate output transcription (English) during the turn
+              if (message?.serverContent?.outputTranscription?.text) {
+                const chunk = message.serverContent.outputTranscription.text.trim();
+                if (chunk) {
+                  currentTurnTranscript = currentTurnTranscript ? currentTurnTranscript + ' ' + chunk : chunk;
+                  console.log('[gemini] EN:', chunk);
+                }
               }
 
-              // Optional: log the model's spoken output transcript (English)
-              if (message?.serverContent?.outputTranscription?.text) {
-                console.log('[gemini] EN:', message.serverContent.outputTranscription.text);
+              // End of model response: play accumulated transcript via TTS
+              if (message?.serverContent?.turnComplete === true) {
+                console.log('[gemini] EN (end of response)');
+                if (currentTurnTranscript.trim()) {
+                  playTts(currentTurnTranscript.trim());
+                }
+                currentTurnTranscript = '';
               }
             } catch (e) {
               console.error('[gemini] onmessage handler error', e);
@@ -455,6 +496,7 @@ export function createGeminiLiveTranslator({
     flushOutboundPcmRemainderWithSilence();
     stopFfmpegResampler();
 
+    currentTurnTranscript = '';
     geminiFrameCarry = Buffer.alloc(0);
     outboundMulawQueue = [];
 
@@ -469,6 +511,6 @@ export function createGeminiLiveTranslator({
     }
   }
 
-  return { start, handleInboundPcm, stop };
+  return { start, handleInboundPcm, stop, playTts };
 }
 
