@@ -49,21 +49,38 @@ const connState = {
 };
 
 // let wsConnection = null
-let gemini = null
-let mode = 'main-menu' // translation | summary | main-menu
+let gemini = null;
+let mode = 'main-menu'; // translation | summary | main-menu
+/** Set when stream starts, cleared when stream stops. Used to save recording when ending translation. */
+let activeFlushRecording = null;
 
 wss.on('connection', (ws, req) => {
-  // wsConnection = ws;
-  // Recording is intentionally disabled (to minimize latency).
-  /*const gemini = createGeminiLiveTranslator({
-    ws,
-    getStreamSid: () => connState.streamSid,
-  });*/
   gemini = createGeminiLiveTranslator({
     ws,
     getStreamSid: () => connState.streamSid,
   });
-  
+
+  const recordMulawBuffers = [];
+  const recordPcmBuffers = [];
+
+  function flushRecording() {
+    ensureRecordingsDir();
+    const timestamp = Date.now();
+    const basePath = `${RECORDINGS_DIR}/${timestamp}`;
+    if ((recordCodec === 'mulaw' || recordCodec === 'both') && recordMulawBuffers.length > 0) {
+      const mulawBuffer = Buffer.concat(recordMulawBuffers);
+      const p = recordCodec === 'both' ? `${basePath}_mulaw.wav` : `${basePath}.wav`;
+      writeMulawWavFile(p, mulawBuffer, 8000);
+    }
+    if ((recordCodec === 'pcm' || recordCodec === 'both') && recordPcmBuffers.length > 0) {
+      const pcmBuffer = Buffer.concat(recordPcmBuffers);
+      const p = recordCodec === 'both' ? `${basePath}_pcm.wav` : `${basePath}.wav`;
+      writeWavFile(p, pcmBuffer, 8000);
+    }
+    recordMulawBuffers.length = 0;
+    recordPcmBuffers.length = 0;
+  }
+
   function stopStream() {
     gemini.stop();
   }
@@ -77,7 +94,7 @@ wss.on('connection', (ws, req) => {
           break;
         case 'start':
           connState.streamSid = msg.streamSid;
-          // gemini.start();
+          activeFlushRecording = flushRecording;
 
           console.log('[stream] start', {
             streamSid: msg.streamSid,
@@ -93,6 +110,10 @@ wss.on('connection', (ws, req) => {
         case 'media':
           if (msg.media?.payload) {
             const mulaw = Buffer.from(msg.media.payload, 'base64');
+            if (recordingEnabled) recordMulawBuffers.push(Buffer.from(mulaw));
+            if (recordingEnabled && (recordCodec === 'pcm' || recordCodec === 'both')) {
+              recordPcmBuffers.push(mulawToPcm(mulaw));
+            }
             const pcm = mulawToPcm(mulaw);
             if (mode === 'translation') {
               gemini.handleInboundPcm(pcm, msg.media?.track);
@@ -101,6 +122,7 @@ wss.on('connection', (ws, req) => {
           break;
         case 'stop':
           console.log('[stream] stop', msg.streamSid);
+          activeFlushRecording = null;
           if (recordingEnabled) flushRecording();
           stopStream();
           connState.streamSid = null;
@@ -173,6 +195,35 @@ function getLatestRecordingPath() {
   return list.length > 0 ? path.join(RECORDINGS_DIR, list[0].file) : null;
 }
 
+/** Summarize the latest recording via Gemini. Returns { file, summary }. Throws on error. */
+async function summarizeLatestRecording() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY not set.');
+  }
+  const filePath = getLatestRecordingPath();
+  if (!filePath) {
+    throw new Error('No recordings found in recordings/.');
+  }
+  const base64Audio = fs.readFileSync(filePath, { encoding: 'base64' });
+  const ai = new GoogleGenAI({ apiKey });
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: [
+      { text: 'Summarize this audio recording. Provide a concise summary of what was discussed.' },
+      { inlineData: { mimeType: 'audio/wav', data: base64Audio } },
+    ],
+  });
+  const summary = response?.text?.trim() ?? '';
+  const file = path.basename(filePath);
+  return { file, summary };
+}
+
+/** Call summarize-latest; returns { file, summary } or throws (convenience wrapper). */
+async function summarizeLatest() {
+  return summarizeLatestRecording();
+}
+
 /** Safe filename: only basename, no path traversal */
 function safeRecordingFilename(name) {
   const base = path.basename(name);
@@ -225,33 +276,16 @@ app.get('/api/summarize', async (req, res) => {
 });
 
 app.get('/summarize-latest', async (req, res) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-  }
-
-  const filePath = getLatestRecordingPath();
-  if (!filePath) {
-    return res.status(404).json({ error: 'No recordings found in recordings/.' });
-  }
-
   try {
-    const base64Audio = fs.readFileSync(filePath, { encoding: 'base64' });
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [
-        { text: 'Summarize this audio recording. Provide a concise summary of what was discussed.' },
-        { inlineData: { mimeType: 'audio/wav', data: base64Audio } },
-      ],
-    });
-
-    const summary = response?.text?.trim() ?? '';
-    const filename = path.basename(filePath);
-    res.json({ file: filename, summary });
+    const data = await summarizeLatestRecording();
+    res.json(data);
   } catch (err) {
     console.error('[summarize-latest] error', err?.message ?? err);
-    res.status(500).json({ error: err.message || 'Failed to summarize audio.' });
+    if (err.message === 'No recordings found in recordings/.') {
+      res.status(404).json({ error: err.message });
+    } else {
+      res.status(500).json({ error: err.message || 'Failed to summarize audio.' });
+    }
   }
 });
 
@@ -383,10 +417,21 @@ app.all('/transcribe', (req, res) => {
           console.log('[transcribe] end translation detected:', transcript);
           gemini.stop();
           mode = 'main-menu';
-          gemini.playTts(`Okay Translation is ended. What else can I help you with?`);
+          gemini.playTts(`Okay. Translation ended. What else can I help you with?`);
         } else if (/please.* summarize/i.test(transcript) && mode !== 'summary') {
-          console.log('[transcribe] start summary detected:', transcript);
-          gemini.playTts(`Okay. Summarizing the conversation in progress...`);
+          console.log('[transcribe] please summarize detected:', transcript);
+          mode = 'summary';
+          gemini.playTts(`Okay. Summarizing...`);
+          if (recordingEnabled && activeFlushRecording) {
+            activeFlushRecording();
+          }
+          summarizeLatest()
+            .then((data) => {
+              if (data?.summary && gemini) {
+                gemini.playTts(data.summary);
+              }
+            })
+            .catch((err) => console.error('[transcribe] summarize-latest error', err?.message ?? err));
         }
       }
     } catch (e) {
