@@ -1,10 +1,18 @@
 import 'dotenv/config';
+import fs from 'fs';
+import path from 'path';
+import { spawn } from 'child_process';
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import twilio from 'twilio';
+import { GoogleGenAI } from '@google/genai';
 import {
   mulawToPcm,
+  ensureRecordingsDir,
+  writeMulawWavFile,
+  writeWavFile,
+  RECORDINGS_DIR,
 } from './audio.js';
 import { createGeminiLiveTranslator } from './geminiLive.js';
 
@@ -28,6 +36,9 @@ const twilioClient =
     ? twilio(accountSid, authToken)
     : null;
 
+const recordCodec = (process.env.RECORD_CODEC || '').toLowerCase();
+const recordingEnabled = ['pcm', 'mulaw', 'both'].includes(recordCodec);
+
 // --- WebSocket server for Twilio Media Streams ---
 
 const server = createServer(app);
@@ -38,12 +49,35 @@ wss.on('connection', (ws, req) => {
     streamSid: null,
   };
 
+  const recordMulawBuffers = [];
+  const recordPcmBuffers = [];
+
   const gemini = createGeminiLiveTranslator({
     ws,
     getStreamSid: () => connState.streamSid,
   });
 
-  // Recording is intentionally disabled (to minimize latency).
+  // Recording runs when RECORD_CODEC is set to pcm, mulaw, or both.
+  function flushRecording() {
+    ensureRecordingsDir();
+    const timestamp = Date.now();
+    const basePath = `${RECORDINGS_DIR}/${timestamp}`;
+
+    if ((recordCodec === 'mulaw' || recordCodec === 'both') && recordMulawBuffers.length > 0) {
+      const mulawBuffer = Buffer.concat(recordMulawBuffers);
+      const path = recordCodec === 'both' ? `${basePath}_mulaw.wav` : `${basePath}.wav`;
+      writeMulawWavFile(path, mulawBuffer, 8000);
+    }
+    if ((recordCodec === 'pcm' || recordCodec === 'both') && recordPcmBuffers.length > 0) {
+      const pcmBuffer = Buffer.concat(recordPcmBuffers);
+      const path = recordCodec === 'both' ? `${basePath}_pcm.wav` : `${basePath}.wav`;
+      writeWavFile(path, pcmBuffer, 8000);
+    }
+
+    recordMulawBuffers.length = 0;
+    recordPcmBuffers.length = 0;
+  }
+
   function stopStream() {
     gemini.stop();
   }
@@ -71,10 +105,15 @@ wss.on('connection', (ws, req) => {
             const mulaw = Buffer.from(msg.media.payload, 'base64');
             const pcm = mulawToPcm(mulaw);
             gemini.handleInboundPcm(pcm, msg.media?.track);
+            if (recordingEnabled) {
+              if (recordCodec === 'mulaw' || recordCodec === 'both') recordMulawBuffers.push(mulaw);
+              if (recordCodec === 'pcm' || recordCodec === 'both') recordPcmBuffers.push(pcm);
+            }
           }
           break;
         case 'stop':
           console.log('[stream] stop', msg.streamSid);
+          if (recordingEnabled) flushRecording();
           stopStream();
           connState.streamSid = null;
           break;
@@ -118,6 +157,114 @@ app.all('/voice', (req, res) => {
   // The call stays connected while the stream is active
   res.type('text/xml');
   res.send(response.toString());
+});
+
+// --- Recordings list and summarize ---
+
+function listRecordings() {
+  try {
+    if (!fs.existsSync(RECORDINGS_DIR)) return [];
+    const files = fs.readdirSync(RECORDINGS_DIR).filter((f) => f.endsWith('.wav'));
+    files.sort((a, b) => {
+      const tsA = a.replace(/_?(mulaw|pcm)?\.wav$/i, '');
+      const tsB = b.replace(/_?(mulaw|pcm)?\.wav$/i, '');
+      return Number(tsB) - Number(tsA);
+    });
+    return files.map((f) => {
+      const ts = f.replace(/_?(mulaw|pcm)?\.wav$/i, '');
+      const n = Number(ts);
+      return { file: f, timestamp: Number.isNaN(n) ? null : n };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function getLatestRecordingPath() {
+  const list = listRecordings();
+  return list.length > 0 ? path.join(RECORDINGS_DIR, list[0].file) : null;
+}
+
+/** Safe filename: only basename, no path traversal */
+function safeRecordingFilename(name) {
+  const base = path.basename(name);
+  return base.endsWith('.wav') && !base.includes('..') ? base : null;
+}
+
+app.get('/api/recordings', (req, res) => {
+  res.json({ recordings: listRecordings() });
+});
+
+app.get('/api/summarize', async (req, res) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+  }
+
+  const filename = safeRecordingFilename(req.query.file || '');
+  if (!filename) {
+    return res.status(400).json({ error: 'Missing or invalid "file" (e.g. 1769666978398.wav).' });
+  }
+
+  const filePath = path.join(RECORDINGS_DIR, filename);
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    return res.status(404).json({ error: 'Recording not found.' });
+  }
+
+  const lang = (req.query.lang || 'en').toLowerCase();
+  const langInstruction =
+    lang === 'th' ? 'Write the summary in Thai (ไทย).' : 'Write the summary in English.';
+
+  try {
+    const base64Audio = fs.readFileSync(filePath, { encoding: 'base64' });
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+          text: `Summarize this audio recording. Provide a concise summary of what was discussed. ${langInstruction}`,
+        },
+        { inlineData: { mimeType: 'audio/wav', data: base64Audio } },
+      ],
+    });
+
+    const summary = response?.text?.trim() ?? '';
+    res.json({ file: filename, summary });
+  } catch (err) {
+    console.error('[api/summarize] error', err?.message ?? err);
+    res.status(500).json({ error: err.message || 'Failed to summarize audio.' });
+  }
+});
+
+app.get('/summarize-latest', async (req, res) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+  }
+
+  const filePath = getLatestRecordingPath();
+  if (!filePath) {
+    return res.status(404).json({ error: 'No recordings found in recordings/.' });
+  }
+
+  try {
+    const base64Audio = fs.readFileSync(filePath, { encoding: 'base64' });
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        { text: 'Summarize this audio recording. Provide a concise summary of what was discussed.' },
+        { inlineData: { mimeType: 'audio/wav', data: base64Audio } },
+      ],
+    });
+
+    const summary = response?.text?.trim() ?? '';
+    const filename = path.basename(filePath);
+    res.json({ file: filename, summary });
+  } catch (err) {
+    console.error('[summarize-latest] error', err?.message ?? err);
+    res.status(500).json({ error: err.message || 'Failed to summarize audio.' });
+  }
 });
 
 // --- Initiate outbound call ---
@@ -246,12 +393,21 @@ app.all('/transcribe', (req, res) => {
   res.status(200).json({ received: true });
 });
 
+// --- Recordings page (list + summarize) ---
+
+app.get('/recordings', (req, res) => {
+  res.sendFile(path.join(process.cwd(), 'public', 'recordings.html'));
+});
+
 // --- Health ---
 
 app.get('/', (req, res) => {
   res.json({
     service: 'meeting-bot',
     endpoints: {
+      'GET /recordings': 'Recordings page (list + summarize)',
+      'GET /api/recordings': 'List recordings',
+      'GET /api/summarize?file=<name>': 'Summarize a recording',
       'POST /call': 'Start outbound call (body: { from?, to })',
       'POST /call/zoom': 'Start outbound call that joins Zoom via SIP (body: { from?, to, meetingId, passcode? })',
       'GET/POST /transcribe': 'Echo and print request payload (query + body)',
@@ -263,10 +419,31 @@ app.get('/', (req, res) => {
   });
 });
 
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
   console.log(`WebSocket (Twilio stream): ${WS_BASE}/stream`);
   if (!twilioClient) {
     console.log('Twilio not configured. Set env vars to enable /call.');
   }
+  // Check ffmpeg once at startup so user knows to install or set FFMPEG_PATH
+  let ffmpegWarned = false;
+  const ffmpegCheck = spawn(FFMPEG_PATH, ['-version'], { stdio: 'ignore' });
+  ffmpegCheck.on('error', (err) => {
+    if (ffmpegWarned) return;
+    ffmpegWarned = true;
+    if (err?.code === 'ENOENT') {
+      console.error(
+        '[ffmpeg] not found in PATH. Outbound audio will be dropped. Install ffmpeg or set FFMPEG_PATH.'
+      );
+    } else {
+      console.error('[ffmpeg] check failed:', err?.message ?? err);
+    }
+  });
+  ffmpegCheck.on('close', (code) => {
+    if (ffmpegWarned || code === 0 || code == null) return;
+    ffmpegWarned = true;
+    console.error('[ffmpeg] exited with code', code, '— outbound audio will be dropped.');
+  });
 });

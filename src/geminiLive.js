@@ -1,10 +1,11 @@
 import { GoogleGenAI, Modality } from '@google/genai';
-import { pcmToMulaw, resamplePcm16 } from './audio.js';
+import { pcmToMulaw } from './audio.js';
 import { spawn } from 'child_process';
 
 const clientsByKey = new Map();
 
 const LATENCY_LOG = process.env.LATENCY_LOG === '1';
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
 
 function getClient(apiKey) {
@@ -46,7 +47,7 @@ export function createGeminiLiveTranslator({
   let ffmpegUnavailable = false;
   let ffmpegPcmCarry = Buffer.alloc(0);
   let outboundPcm8kRemainder = Buffer.alloc(0);
-  let fallbackPcm24kBuffer = Buffer.alloc(0);
+  let ffmpegUnavailableLogged = false;
 
   // --- latency tracing (opt-in) ---
   let lastInboundPcmAt = 0;
@@ -70,8 +71,6 @@ export function createGeminiLiveTranslator({
   const OUT_SAMPLE_RATE = 8000;
   const FRAME_SAMPLES = 160; // 20ms @ 8kHz
   const FRAME_BYTES_PCM16 = FRAME_SAMPLES * 2; // 320 bytes
-  const FALLBACK_MIN_CHUNK_MS = 250;
-  const FALLBACK_MIN_CHUNK_BYTES_24K = Math.floor((24000 * FALLBACK_MIN_CHUNK_MS) / 1000) * 2; // 4800 bytes
 
   function enqueueOutboundPcm8k(pcm8k) {
     if (!pcm8k || pcm8k.length === 0) return;
@@ -126,7 +125,7 @@ export function createGeminiLiveTranslator({
     try {
       const t0 = nowMs();
       ffmpegResampler = spawn(
-        'ffmpeg',
+        FFMPEG_PATH,
         [
           '-hide_banner',
           '-loglevel',
@@ -159,8 +158,7 @@ export function createGeminiLiveTranslator({
     }
 
     ffmpegResampler.on('error', (err) => {
-      // e.g. ENOENT if ffmpeg isn't installed
-      console.warn('[gemini] ffmpeg resampler unavailable, falling back to linear resample:', err?.message ?? err);
+      console.error('[gemini] ffmpeg resampler unavailable:', err?.message ?? err);
       ffmpegUnavailable = true;
       stopFfmpegResampler();
     });
@@ -168,7 +166,7 @@ export function createGeminiLiveTranslator({
     ffmpegResampler.on('close', (code, signal) => {
       if (ffmpegUnavailable) return;
       if (code === 0) return;
-      console.warn('[gemini] ffmpeg resampler exited, falling back to linear resample:', { code, signal });
+      console.error('[gemini] ffmpeg resampler exited:', { code, signal });
       ffmpegUnavailable = true;
       stopFfmpegResampler();
     });
@@ -201,14 +199,12 @@ export function createGeminiLiveTranslator({
   }
 
   function resetOutboundAudioPipeline() {
+    // On Gemini "interrupted" (e.g. user spoke): clear queues so we don't play stale audio.
+    // Do NOT kill ffmpeg — keep it running for the next response.
     outboundMulawQueue = [];
     outboundPcm8kRemainder = Buffer.alloc(0);
-    fallbackPcm24kBuffer = Buffer.alloc(0);
-    stopOutboundPlayback();
-    stopFfmpegResampler();
-    // Allow retrying ffmpeg if it exited unexpectedly but is installed.
-    // If it's genuinely unavailable (ENOENT), we'll keep the fallback.
     ffmpegPcmCarry = Buffer.alloc(0);
+    stopOutboundPlayback();
   }
 
   function logMissingKeyOnce() {
@@ -338,6 +334,8 @@ export function createGeminiLiveTranslator({
         callbacks: {
           onopen: () => {
             console.log('[gemini] live session opened');
+            // Warm up ffmpeg resampler so first Gemini audio isn't lost to cold start / internal buffering
+            if (!ffmpegUnavailable) startFfmpegResampler();
           },
           onmessage: (message) => {
             try {
@@ -366,18 +364,9 @@ export function createGeminiLiveTranslator({
                   if (ffmpegResampler?.stdin?.writable && !ffmpegUnavailable) {
                     ffmpegResampler.stdin.write(pcm24k);
                   } else {
-                    // Fallback (lower quality): linear resample in JS
-                    // Buffer and resample in larger chunks to reduce zipper noise.
-                    fallbackPcm24kBuffer = Buffer.concat([fallbackPcm24kBuffer, pcm24k]);
-                    // Keep alignment.
-                    if (fallbackPcm24kBuffer.length % 2 !== 0) {
-                      fallbackPcm24kBuffer = fallbackPcm24kBuffer.subarray(0, fallbackPcm24kBuffer.length - 1);
-                    }
-                    while (fallbackPcm24kBuffer.length >= FALLBACK_MIN_CHUNK_BYTES_24K) {
-                      const chunk24k = fallbackPcm24kBuffer.subarray(0, FALLBACK_MIN_CHUNK_BYTES_24K);
-                      fallbackPcm24kBuffer = fallbackPcm24kBuffer.subarray(FALLBACK_MIN_CHUNK_BYTES_24K);
-                      const pcm8k = resamplePcm16(chunk24k, 24000, OUT_SAMPLE_RATE);
-                      enqueueOutboundPcm8k(pcm8k);
+                    if (!ffmpegUnavailableLogged) {
+                      ffmpegUnavailableLogged = true;
+                      console.error('[gemini] ffmpeg not available; outbound audio dropped. Install ffmpeg or set FFMPEG_PATH.');
                     }
                   }
                 }
