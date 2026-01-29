@@ -234,6 +234,19 @@ app.get('/api/recordings', (req, res) => {
   res.json({ recordings: listRecordings() });
 });
 
+app.get('/api/recordings/audio/:filename', (req, res) => {
+  const filename = safeRecordingFilename(req.params.filename || '');
+  if (!filename) {
+    return res.status(400).json({ error: 'Invalid filename.' });
+  }
+  const filePath = path.join(RECORDINGS_DIR, filename);
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    return res.status(404).json({ error: 'Recording not found.' });
+  }
+  res.type('audio/wav');
+  res.sendFile(path.resolve(filePath));
+});
+
 app.get('/api/summarize', async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -251,8 +264,23 @@ app.get('/api/summarize', async (req, res) => {
   }
 
   const lang = (req.query.lang || 'en').toLowerCase();
-  const langInstruction =
-    lang === 'th' ? 'Write the summary in Thai (ไทย).' : 'Write the summary in English.';
+  const langInstructions = {
+    en: 'Write the summary in English.',
+    th: 'Write the summary in Thai (ไทย).',
+    es: 'Write the summary in Spanish (Español).',
+    fr: 'Write the summary in French (Français).',
+    de: 'Write the summary in German (Deutsch).',
+    ja: 'Write the summary in Japanese (日本語).',
+    zh: 'Write the summary in Chinese (中文).',
+    ko: 'Write the summary in Korean (한국어).',
+    hi: 'Write the summary in Hindi (हिन्दी).',
+    ar: 'Write the summary in Arabic (العربية).',
+    pt: 'Write the summary in Portuguese (Português).',
+    it: 'Write the summary in Italian (Italiano).',
+    vi: 'Write the summary in Vietnamese (Tiếng Việt).',
+    id: 'Write the summary in Indonesian (Bahasa Indonesia).',
+  };
+  const langInstruction = langInstructions[lang] || langInstructions.en;
 
   try {
     const base64Audio = fs.readFileSync(filePath, { encoding: 'base64' });
@@ -457,6 +485,7 @@ app.get('/', (req, res) => {
     endpoints: {
       'GET /recordings': 'Recordings page (list + summarize)',
       'GET /api/recordings': 'List recordings',
+      'GET /api/recordings/audio/:filename': 'Stream a recording (WAV) for playback',
       'GET /api/summarize?file=<name>': 'Summarize a recording',
       'POST /call': 'Start outbound call (body: { from?, to })',
       'POST /call/zoom': 'Start outbound call that joins Zoom via SIP (body: { from?, to, meetingId, passcode? })',

@@ -49,6 +49,12 @@
     .recordings-list li {
       margin: 0;
     }
+    .recordings-list .date {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 0.15rem;
+    }
     .recordings-list button {
       width: 100%;
       text-align: left;
@@ -67,12 +73,6 @@
       background: rgba(167, 139, 250, 0.12);
       border-left-color: var(--accent);
       color: var(--accent);
-    }
-    .recordings-list .date {
-      display: block;
-      font-size: 0.75rem;
-      color: var(--muted);
-      margin-top: 0.15rem;
     }
     .main {
       padding: 1.5rem 2rem;
@@ -123,6 +123,29 @@
       white-space: pre-wrap;
       line-height: 1.5;
     }
+    .playback-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .playback-box.hidden {
+      display: none;
+    }
+    .playback-box .playback-label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+    .playback-box audio {
+      width: 100%;
+      max-width: 400px;
+      height: 40px;
+    }
+    .playback-box audio::-webkit-media-controls-panel {
+      background: var(--surface);
+    }
     .summary-box.empty {
       color: var(--muted);
       font-style: italic;
@@ -156,9 +179,25 @@
           <select id="lang" aria-label="Summary language">
             <option value="en">English</option>
             <option value="th">ไทย</option>
+            <option value="es">Español</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="ja">日本語</option>
+            <option value="zh">中文</option>
+            <option value="ko">한국어</option>
+            <option value="hi">हिन्दी</option>
+            <option value="ar">العربية</option>
+            <option value="pt">Português</option>
+            <option value="it">Italiano</option>
+            <option value="vi">Tiếng Việt</option>
+            <option value="id">Bahasa Indonesia</option>
           </select>
         </div>
       </header>
+      <div class="playback-box hidden" id="playbackBox">
+        <div class="playback-label" id="playbackLabel">Playback</div>
+        <audio id="playbackAudio" controls preload="metadata" title="Play recording"></audio>
+      </div>
       <div class="summary-box empty" id="summary">Select a recording to generate a summary.</div>
     </main>
   </div>
@@ -167,6 +206,9 @@
     const emptyListEl = document.getElementById('emptyList');
     const summaryEl = document.getElementById('summary');
     const langEl = document.getElementById('lang');
+    const playbackBox = document.getElementById('playbackBox');
+    const playbackLabel = document.getElementById('playbackLabel');
+    const playbackAudio = document.getElementById('playbackAudio');
 
     let selectedFile = null;
 
@@ -211,9 +253,23 @@
       });
     }
 
+    function setPlayback(file) {
+      if (!file) {
+        playbackBox.classList.add('hidden');
+        playbackAudio.removeAttribute('src');
+        playbackAudio.load();
+        return;
+      }
+      playbackBox.classList.remove('hidden');
+      playbackLabel.textContent = 'Playback: ' + file;
+      playbackAudio.src = '/api/recordings/audio/' + encodeURIComponent(file);
+      playbackAudio.title = 'Play ' + file;
+    }
+
     async function selectRecording(file) {
       selectedFile = file || null;
       setActive(file);
+      setPlayback(file);
       summaryEl.className = 'summary-box loading';
       summaryEl.textContent = 'Generating summary…';
       try {
