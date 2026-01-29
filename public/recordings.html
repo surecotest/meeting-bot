@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Recordings · Meeting Bot</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --surface: #18181c;
+      --border: #2a2a30;
+      --text: #e4e4e7;
+      --muted: #71717a;
+      --accent: #a78bfa;
+      --accent-hover: #c4b5fd;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      min-height: 100vh;
+    }
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 1rem 0;
+      overflow-y: auto;
+    }
+    .sidebar h2 {
+      margin: 0 1rem 0.75rem;
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .recordings-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .recordings-list li {
+      margin: 0;
+    }
+    .recordings-list button {
+      width: 100%;
+      text-align: left;
+      padding: 0.6rem 1rem;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+      border-left: 3px solid transparent;
+    }
+    .recordings-list button:hover {
+      background: rgba(255,255,255,0.04);
+    }
+    .recordings-list button.active {
+      background: rgba(167, 139, 250, 0.12);
+      border-left-color: var(--accent);
+      color: var(--accent);
+    }
+    .recordings-list .date {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 0.15rem;
+    }
+    .main {
+      padding: 1.5rem 2rem;
+      overflow-y: auto;
+    }
+    .main header {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+    .main h1 {
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 600;
+    }
+    .lang-switch {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+    .lang-switch label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-right: 0.25rem;
+    }
+    .lang-switch select {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 0.35rem 0.6rem;
+      font-size: 0.875rem;
+      cursor: pointer;
+    }
+    .lang-switch select:hover,
+    .lang-switch select:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+    .summary-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      min-height: 120px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .summary-box.empty {
+      color: var(--muted);
+      font-style: italic;
+    }
+    .summary-box.loading {
+      color: var(--muted);
+    }
+    .error {
+      color: #f87171;
+      font-size: 0.9rem;
+    }
+    .empty-list {
+      padding: 1rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>Recordings</h2>
+      <ul class="recordings-list" id="list"></ul>
+      <p class="empty-list" id="emptyList" hidden>No recordings yet.</p>
+    </aside>
+    <main class="main">
+      <header>
+        <h1>Summary</h1>
+        <div class="lang-switch">
+          <label for="lang">Language</label>
+          <select id="lang" aria-label="Summary language">
+            <option value="en">English</option>
+            <option value="th">ไทย</option>
+          </select>
+        </div>
+      </header>
+      <div class="summary-box empty" id="summary">Select a recording to generate a summary.</div>
+    </main>
+  </div>
+  <script>
+    const listEl = document.getElementById('list');
+    const emptyListEl = document.getElementById('emptyList');
+    const summaryEl = document.getElementById('summary');
+    const langEl = document.getElementById('lang');
+
+    let selectedFile = null;
+
+    function formatDate(ts) {
+      if (!ts) return '';
+      const d = new Date(ts);
+      return d.toLocaleString();
+    }
+
+    async function loadRecordings() {
+      try {
+        const res = await fetch('/api/recordings');
+        const data = await res.json();
+        const recordings = data.recordings || [];
+        listEl.innerHTML = '';
+        emptyListEl.hidden = recordings.length > 0;
+        recordings.forEach((r) => {
+          const li = document.createElement('li');
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.dataset.file = r.file;
+          btn.textContent = r.file;
+          if (r.timestamp) {
+            const date = document.createElement('span');
+            date.className = 'date';
+            date.textContent = formatDate(r.timestamp);
+            btn.appendChild(date);
+          }
+          btn.addEventListener('click', () => selectRecording(r.file));
+          li.appendChild(btn);
+          listEl.appendChild(li);
+        });
+      } catch (e) {
+        summaryEl.className = 'summary-box';
+        summaryEl.innerHTML = '<span class="error">Failed to load recordings.</span>';
+      }
+    }
+
+    function setActive(file) {
+      listEl.querySelectorAll('button').forEach((b) => {
+        b.classList.toggle('active', b.dataset.file === file);
+      });
+    }
+
+    async function selectRecording(file) {
+      selectedFile = file || null;
+      setActive(file);
+      summaryEl.className = 'summary-box loading';
+      summaryEl.textContent = 'Generating summary…';
+      try {
+        const lang = langEl.value;
+        const res = await fetch('/api/summarize?file=' + encodeURIComponent(file) + '&lang=' + encodeURIComponent(lang));
+        const data = await res.json();
+        if (!res.ok) {
+          summaryEl.className = 'summary-box';
+          summaryEl.innerHTML = '<span class="error">' + (data.error || 'Failed to summarize') + '</span>';
+          return;
+        }
+        summaryEl.className = 'summary-box';
+        summaryEl.textContent = data.summary || '';
+      } catch (e) {
+        summaryEl.className = 'summary-box';
+        summaryEl.innerHTML = '<span class="error">Request failed.</span>';
+      }
+    }
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    langEl.addEventListener('change', () => {
+      if (selectedFile) selectRecording(selectedFile);
+    });
+
+    loadRecordings();
+  </script>
+</body>
+</html>
